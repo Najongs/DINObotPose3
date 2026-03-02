@@ -5,6 +5,15 @@ __pycache__/
 
 # C extensions
 *.so
+RoboPEPP/
+robopose/
+outputs/
+.claude/
+Dataset/
+DREAM/
+robopose/
+eval_outputs*/
+panda-description/
 
 # Distribution / packaging
 .Python

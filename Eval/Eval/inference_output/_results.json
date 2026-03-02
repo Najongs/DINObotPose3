@@ -1,0 +1,117 @@
+{
+    "image_path": "/data/public/NAS/DINObotPose2/Eval/zed_41182735_left_1756275914.348.jpg",
+    "json_path": "/data/public/NAS/DINObotPose2/Eval/zed_41182735_left_1756275914.348.json",
+    "image_size": [
+        1920,
+        1200
+    ],
+    "keypoints_2d": [
+        {
+            "name": "panda_link0",
+            "x": -999.0,
+            "y": -999.0,
+            "peak_logit": 0.012715622782707214,
+            "peak_sigmoid": 0.5031788349151611
+        },
+        {
+            "name": "panda_link2",
+            "x": 1106.25,
+            "y": 550.78125,
+            "peak_logit": 0.9274327754974365,
+            "peak_sigmoid": 0.7165541648864746
+        },
+        {
+            "name": "panda_link3",
+            "x": 1125.0,
+            "y": 253.125,
+            "peak_logit": 0.895845353603363,
+            "peak_sigmoid": 0.7100949883460999
+        },
+        {
+            "name": "panda_link4",
+            "x": 1057.5,
+            "y": 262.5,
+            "peak_logit": 0.7834192514419556,
+            "peak_sigmoid": 0.6864166259765625
+        },
+        {
+            "name": "panda_link6",
+            "x": 855.0,
+            "y": 330.46875,
+            "peak_logit": 0.7090541124343872,
+            "peak_sigmoid": 0.6701921224594116
+        },
+        {
+            "name": "panda_link7",
+            "x": 873.75,
+            "y": 314.0625,
+            "peak_logit": 0.6128158569335938,
+            "peak_sigmoid": 0.6485828757286072
+        },
+        {
+            "name": "panda_hand",
+            "x": 828.75,
+            "y": 344.53125,
+            "peak_logit": 0.6578449010848999,
+            "peak_sigmoid": 0.6587761044502258
+        }
+    ],
+    "keypoints_3d": [
+        {
+            "name": "panda_link0",
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+        },
+        {
+            "name": "panda_link2",
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.3330000042915344
+        },
+        {
+            "name": "panda_link3",
+            "x": -0.1096457690000534,
+            "y": -0.016750911250710487,
+            "z": 0.6288939714431763
+        },
+        {
+            "name": "panda_link4",
+            "x": -0.037152692675590515,
+            "y": -0.047059811651706696,
+            "z": 0.6540409922599792
+        },
+        {
+            "name": "panda_link6",
+            "x": 0.3243970274925232,
+            "y": -0.1541064977645874,
+            "z": 0.5441089868545532
+        },
+        {
+            "name": "panda_link7",
+            "x": 0.4070677161216736,
+            "y": -0.17927062511444092,
+            "z": 0.5607318878173828
+        },
+        {
+            "name": "panda_hand",
+            "x": 0.4285656809806824,
+            "y": -0.17787867784500122,
+            "z": 0.45592302083969116
+        }
+    ],
+    "joint_angles": [
+        0.15160077810287476,
+        -0.35864537954330444,
+        -0.5188358426094055,
+        -2.385335922241211,
+        -0.11961797624826431,
+        2.254124402999878
+    ],
+    "keypoints_3d_camera": null,
+    "model_path": "/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260301_045023/best_model.pth",
+    "model_name": "facebook/dinov3-vitb16-pretrain-lvd1689m",
+    "pred_3d_source": "fk",
+    "kp_min_confidence": 0.01,
+    "kp_min_peak_logit": 0.1
+}

@@ -1,0 +1,90 @@
+{
+    "image_path": "/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/franka_research3/franka_research3_pose2/Panda_dataset_10th/view1/zed_41182735_left_1756279691.298.jpg",
+    "image_size": [
+        1920,
+        1200
+    ],
+    "keypoints_2d": [
+        {
+            "name": "panda_link0",
+            "x": 1125.0,
+            "y": 799.21875
+        },
+        {
+            "name": "panda_link2",
+            "x": 1121.25,
+            "y": 553.125
+        },
+        {
+            "name": "panda_link3",
+            "x": 1091.25,
+            "y": 342.1875
+        },
+        {
+            "name": "panda_link4",
+            "x": 1095.0,
+            "y": 349.21875
+        },
+        {
+            "name": "panda_link6",
+            "x": 1023.75,
+            "y": 532.03125
+        },
+        {
+            "name": "panda_link7",
+            "x": 1012.5,
+            "y": 534.375
+        },
+        {
+            "name": "panda_hand",
+            "x": 1023.75,
+            "y": 553.125
+        }
+    ],
+    "keypoints_3d": [
+        {
+            "name": "panda_link0",
+            "x": 0.004347808659076691,
+            "y": 1.1140167713165283,
+            "z": -0.1640855073928833
+        },
+        {
+            "name": "panda_link2",
+            "x": 0.27358341217041016,
+            "y": 1.1339938640594482,
+            "z": -0.23110903799533844
+        },
+        {
+            "name": "panda_link3",
+            "x": 0.11547279357910156,
+            "y": 1.3712990283966064,
+            "z": -0.11260528862476349
+        },
+        {
+            "name": "panda_link4",
+            "x": 0.45812055468559265,
+            "y": 1.4338123798370361,
+            "z": -0.12000085413455963
+        },
+        {
+            "name": "panda_link6",
+            "x": -1.0922706127166748,
+            "y": 1.389801025390625,
+            "z": 0.3515266180038452
+        },
+        {
+            "name": "panda_link7",
+            "x": 0.0076132118701934814,
+            "y": 1.735363245010376,
+            "z": -0.424635112285614
+        },
+        {
+            "name": "panda_hand",
+            "x": 0.3100166916847229,
+            "y": 1.434672236442566,
+            "z": -0.6426334977149963
+        }
+    ],
+    "model_path": "/home/najo/NAS/DIP/DINObotPose2/Train/outputs/dinov3_base_20260301_120855/epoch_29.pth",
+    "model_name": null
+}

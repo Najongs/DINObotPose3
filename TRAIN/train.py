@@ -26,10 +26,222 @@ import cv2
 
 from model import DINOv3PoseEstimator, panda_forward_kinematics
 
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../DREAM')))
-import dream
-from dream import analysis as dream_analysis
+def load_camera_intrinsics(camera_data_path: str) -> np.ndarray:
+    """Load 3x3 camera intrinsic matrix from camera settings file."""
+    if not os.path.exists(camera_data_path):
+        raise FileNotFoundError(f'Expected path "{camera_data_path}" to exist.')
+
+    with open(camera_data_path, "r") as f:
+        cam_settings_data = yaml.safe_load(f)
+
+    intrinsic = cam_settings_data["camera_settings"][0]["intrinsic_settings"]
+    camera_fx = intrinsic["fx"]
+    camera_fy = intrinsic["fy"]
+    camera_cx = intrinsic["cx"]
+    camera_cy = intrinsic["cy"]
+    return np.array(
+        [[camera_fx, 0.0, camera_cx], [0.0, camera_fy, camera_cy], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+
+def load_image_resolution(camera_data_path: str) -> Tuple[int, int]:
+    """Load (width, height) from camera settings file."""
+    if not os.path.exists(camera_data_path):
+        raise FileNotFoundError(f'Expected path "{camera_data_path}" to exist.')
+
+    with open(camera_data_path, "r") as f:
+        cam_settings_data = yaml.safe_load(f)
+
+    size = cam_settings_data["camera_settings"][0]["captured_image_size"]
+    return int(size["width"]), int(size["height"])
+
+
+def keypoint_metrics(keypoints_detected, keypoints_gt, image_resolution, auc_pixel_threshold=20.0):
+    """Compute DREAM-compatible 2D keypoint metrics."""
+    num_gt_outframe = 0
+    num_gt_inframe = 0
+    num_missing_gt_outframe = 0
+    num_found_gt_outframe = 0
+    num_found_gt_inframe = 0
+    num_missing_gt_inframe = 0
+
+    kp_errors = []
+    for kp_proj_detect, kp_proj_gt in zip(keypoints_detected, keypoints_gt):
+        if (
+            kp_proj_gt[0] < 0.0
+            or kp_proj_gt[0] > image_resolution[0]
+            or kp_proj_gt[1] < 0.0
+            or kp_proj_gt[1] > image_resolution[1]
+        ):
+            num_gt_outframe += 1
+            if kp_proj_detect[0] < -999.0 and kp_proj_detect[1] < -999.0:
+                num_missing_gt_outframe += 1
+            else:
+                num_found_gt_outframe += 1
+        else:
+            num_gt_inframe += 1
+            if kp_proj_detect[0] < -999.0 and kp_proj_detect[1] < -999.0:
+                num_missing_gt_inframe += 1
+            else:
+                num_found_gt_inframe += 1
+                kp_errors.append((kp_proj_detect - kp_proj_gt).tolist())
+
+    kp_errors = np.array(kp_errors)
+    if len(kp_errors) > 0:
+        kp_l2_errors = np.linalg.norm(kp_errors, axis=1)
+        kp_l2_error_mean = np.mean(kp_l2_errors)
+        kp_l2_error_median = np.median(kp_l2_errors)
+        kp_l2_error_std = np.std(kp_l2_errors)
+
+        delta_pixel = 0.01
+        pck_values = np.arange(0, auc_pixel_threshold, delta_pixel)
+        y_values = []
+        for value in pck_values:
+            valids = len(np.where(kp_l2_errors < value)[0])
+            y_values.append(valids)
+
+        kp_auc = (
+            np.trapz(y_values, dx=delta_pixel)
+            / float(auc_pixel_threshold)
+            / float(max(1, num_gt_inframe))
+        )
+    else:
+        kp_l2_error_mean = None
+        kp_l2_error_median = None
+        kp_l2_error_std = None
+        kp_auc = None
+
+    return {
+        "num_gt_outframe": num_gt_outframe,
+        "num_missing_gt_outframe": num_missing_gt_outframe,
+        "num_found_gt_outframe": num_found_gt_outframe,
+        "num_gt_inframe": num_gt_inframe,
+        "num_found_gt_inframe": num_found_gt_inframe,
+        "num_missing_gt_inframe": num_missing_gt_inframe,
+        "l2_error_mean_px": kp_l2_error_mean,
+        "l2_error_median_px": kp_l2_error_median,
+        "l2_error_std_px": kp_l2_error_std,
+        "l2_error_auc": kp_auc,
+        "l2_error_auc_thresh_px": auc_pixel_threshold,
+    }
+
+
+def pnp_metrics(
+    pnp_add,
+    num_inframe_projs_gt,
+    num_min_inframe_projs_gt_for_pnp=4,
+    add_auc_threshold=0.1,
+    pnp_magic_number=-999.0,
+):
+    """Compute DREAM-compatible PnP ADD metrics."""
+    pnp_add = np.array(pnp_add)
+    num_inframe_projs_gt = np.array(num_inframe_projs_gt)
+
+    idx_pnp_found = np.where(pnp_add > pnp_magic_number)[0]
+    add_pnp_found = pnp_add[idx_pnp_found]
+    num_pnp_found = len(idx_pnp_found)
+
+    if num_pnp_found > 0:
+        mean_add = np.mean(add_pnp_found)
+        median_add = np.median(add_pnp_found)
+        std_add = np.std(add_pnp_found)
+    else:
+        mean_add = 0.0
+        median_add = 0.0
+        std_add = 0.0
+
+    num_pnp_possible = len(
+        np.where(num_inframe_projs_gt >= num_min_inframe_projs_gt_for_pnp)[0]
+    )
+    num_pnp_not_found = num_pnp_possible - num_pnp_found
+
+    delta_threshold = 0.00001
+    add_threshold_values = np.arange(0.0, add_auc_threshold, delta_threshold)
+    counts = []
+    for value in add_threshold_values:
+        under_threshold = len(np.where(add_pnp_found <= value)[0]) / float(max(1, num_pnp_possible))
+        counts.append(under_threshold)
+    auc = np.trapz(counts, dx=delta_threshold) / float(add_auc_threshold)
+
+    return {
+        "num_pnp_found": num_pnp_found,
+        "num_pnp_not_found": num_pnp_not_found,
+        "num_pnp_possible": num_pnp_possible,
+        "num_min_inframe_projs_gt_for_pnp": num_min_inframe_projs_gt_for_pnp,
+        "pnp_magic_number": pnp_magic_number,
+        "add_mean": mean_add,
+        "add_median": median_add,
+        "add_std": std_add,
+        "add_auc": auc,
+        "add_auc_thresh": add_auc_threshold,
+    }
+
+
+def solve_pnp_with_refinement(canonical_points, projections, camera_K):
+    """Solve PnP with EPnP + iterative refinement."""
+    if len(canonical_points) != len(projections):
+        raise ValueError(
+            f"Expected canonical_points and projections to have same length, got {len(canonical_points)} and {len(projections)}."
+        )
+
+    canonical_points_proc = []
+    projections_proc = []
+    for canon_pt, proj in zip(canonical_points, projections):
+        if (
+            canon_pt is None
+            or len(canon_pt) == 0
+            or canon_pt[0] is None
+            or canon_pt[1] is None
+            or proj is None
+            or len(proj) == 0
+            or proj[0] is None
+            or proj[1] is None
+        ):
+            continue
+        canonical_points_proc.append(canon_pt)
+        projections_proc.append(proj)
+
+    if len(canonical_points_proc) == 0:
+        return False, None, None
+
+    canonical_points_proc = np.array(canonical_points_proc, dtype=np.float64).reshape(-1, 1, 3)
+    projections_proc = np.array(projections_proc, dtype=np.float64).reshape(-1, 1, 2)
+    camera_K = np.array(camera_K, dtype=np.float64)
+    dist_coeffs = np.array([])
+
+    try:
+        pnp_retval, rvec, tvec = cv2.solvePnP(
+            canonical_points_proc,
+            projections_proc,
+            camera_K,
+            dist_coeffs,
+            flags=cv2.SOLVEPNP_EPNP,
+        )
+        if pnp_retval:
+            pnp_retval, rvec, tvec = cv2.solvePnP(
+                canonical_points_proc,
+                projections_proc,
+                camera_K,
+                dist_coeffs,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+                useExtrinsicGuess=True,
+                rvec=rvec,
+                tvec=tvec,
+            )
+        return pnp_retval, rvec, tvec
+    except Exception:
+        return False, None, None
+
+
+def add_from_pose_rvec_tvec(rvec, tvec, keypoint_positions_wrt_cam_gt):
+    """Compute ADD from estimated pose and GT 3D keypoints in camera frame."""
+    R, _ = cv2.Rodrigues(np.array(rvec, dtype=np.float64).reshape(3, 1))
+    t = np.array(tvec, dtype=np.float64).reshape(3)
+    kp_pos = np.array(keypoint_positions_wrt_cam_gt, dtype=np.float64)
+    kp_pos_aligned = (R @ kp_pos.T).T + t.reshape(1, 3)
+    kp_3d_l2_errors = np.linalg.norm(kp_pos_aligned - kp_pos, axis=1)
+    return float(np.mean(kp_3d_l2_errors))
 
 def solve_pnp_epnp(object_points, image_points, camera_matrix):
     """
@@ -1345,7 +1557,7 @@ class Trainer:
             all_kp_pos_gt_np = np.array(all_kp_pos_gt)
 
             # 2D PCK / AUC
-            kp_metrics = dream_analysis.keypoint_metrics(
+            kp_metrics = keypoint_metrics(
                 all_kp_projs_est_np.reshape(-1, 2),
                 all_kp_projs_gt_np.reshape(-1, 2),
                 self.raw_res
@@ -1381,13 +1593,11 @@ class Trainer:
                         n_inframe += 1
                 n_inframe_list.append(n_inframe)
 
-                pnp_retval, translation, quaternion = dream.geometric_vision.solve_pnp(
+                pnp_retval, rvec, tvec = solve_pnp_with_refinement(
                     pos_gt_valid, p_est_valid, self.camera_K
                 )
                 if pnp_retval:
-                    add = dream.geometric_vision.add_from_pose(
-                        translation, quaternion, pos_gt_valid, self.camera_K
-                    )
+                    add = add_from_pose_rvec_tvec(rvec, tvec, pos_gt_valid)
                     # Convert to mm
                     if add < 10.0: # Filter out crazy outliers (larger than 10m)
                         pnp_adds.append(add * 1000.0)
@@ -1397,10 +1607,10 @@ class Trainer:
                     pnp_adds.append(-999.0)
 
             if len(pnp_adds) > 0:
-                pnp_metrics = dream_analysis.pnp_metrics(pnp_adds, n_inframe_list, add_auc_threshold=100.0) # 100mm threshold
-                avg_losses['val_add_auc'] = pnp_metrics.get('add_auc', 0.0)
-                avg_losses['val_add_mean_mm'] = pnp_metrics.get('add_mean', 0.0)
-                avg_losses['val_pnp_success_rate'] = pnp_metrics.get('num_pnp_found', 0) / max(1, pnp_metrics.get('num_pnp_possible', 1))
+                pnp_stats = pnp_metrics(pnp_adds, n_inframe_list, add_auc_threshold=100.0) # 100mm threshold
+                avg_losses['val_add_auc'] = pnp_stats.get('add_auc', 0.0)
+                avg_losses['val_add_mean_mm'] = pnp_stats.get('add_mean', 0.0)
+                avg_losses['val_pnp_success_rate'] = pnp_stats.get('num_pnp_found', 0) / max(1, pnp_stats.get('num_pnp_possible', 1))
             else:
                 avg_losses['val_add_auc'] = 0.0
                 avg_losses['val_add_mean_mm'] = 0.0
@@ -2031,8 +2241,8 @@ def main(args):
     
     if cam_settings_path is not None and cam_settings_path.exists():
         try:
-            camera_K = dream.utilities.load_camera_intrinsics(str(cam_settings_path))
-            raw_res = dream.utilities.load_image_resolution(str(cam_settings_path))
+            camera_K = load_camera_intrinsics(str(cam_settings_path))
+            raw_res = load_image_resolution(str(cam_settings_path))
             if is_main_process:
                 print(f"Loaded camera intrinsics from {cam_settings_path}")
                 print(f"Raw resolution: {raw_res}")

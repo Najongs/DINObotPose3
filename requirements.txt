@@ -10,3 +10,4 @@ torchvision
 tqdm
 wandb
 opencv-python
+albumentations

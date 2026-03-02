@@ -1,0 +1,96 @@
+{
+  "panda_link0_2d_px": 2.64699649810791,
+  "panda_link2_2d_px": 157.2291259765625,
+  "panda_link3_2d_px": 41.863197326660156,
+  "panda_link4_2d_px": 21.458017349243164,
+  "panda_link6_2d_px": 18.642778396606445,
+  "panda_link7_2d_px": 9.55584716796875,
+  "panda_hand_2d_px": 7.7205328941345215,
+  "mean_2d_px": 37.016639709472656,
+  "max_2d_px": 157.2291259765625,
+  "median_2d_px": 18.642778396606445,
+  "panda_link0_3d_m": 0.3425951765364889,
+  "panda_link2_3d_m": 0.5850223912115272,
+  "panda_link3_3d_m": 0.8233302981116881,
+  "panda_link4_3d_m": 0.67298445839297,
+  "panda_link6_3d_m": 0.11407185031285905,
+  "panda_link7_3d_m": 0.22637197249486019,
+  "panda_hand_3d_m": 0.17871526872336757,
+  "mean_3d_m": 0.4204416308262516,
+  "max_3d_m": 0.8233302981116881,
+  "median_3d_m": 0.3425951765364889,
+  "mean_2d_norm": 4.627079963684082,
+  "json_path": "/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure/002138.json",
+  "image_path": "/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_real/panda-3cam_azure/panda-3cam_azure/002138.rgb.jpg",
+  "ignored_keypoints": {
+    "low_peak_logit": [
+      "panda_link2"
+    ],
+    "low_conf": [],
+    "reproj_outlier": [
+      "panda_link3",
+      "panda_link4",
+      "panda_link6",
+      "panda_link7",
+      "panda_hand"
+    ],
+    "pnp_select": []
+  },
+  "pnp": {
+    "mode": "epnp",
+    "reproj_outlier_thresh_px": 12.0,
+    "min_span_px": 20.0,
+    "min_area_ratio": 0.001,
+    "used_keypoints": [
+      0,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "removed_reproj_keypoints": [
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "spread_ok": true,
+    "spread_span_xy_px": [
+      47.5,
+      293.4375
+    ],
+    "spread_area_ratio": 0.04463174538550073
+  },
+  "heatmap_peak": {
+    "panda_link0": {
+      "peak_logit": 0.4650619626045227,
+      "peak_sigmoid": 0.6142143607139587
+    },
+    "panda_link2": {
+      "peak_logit": 0.05193246155977249,
+      "peak_sigmoid": 0.5129801630973816
+    },
+    "panda_link3": {
+      "peak_logit": 0.17490310966968536,
+      "peak_sigmoid": 0.5436146855354309
+    },
+    "panda_link4": {
+      "peak_logit": 0.4770967364311218,
+      "peak_sigmoid": 0.6170620322227478
+    },
+    "panda_link6": {
+      "peak_logit": 0.1528773158788681,
+      "peak_sigmoid": 0.5381450653076172
+    },
+    "panda_link7": {
+      "peak_logit": 0.5038352012634277,
+      "peak_sigmoid": 0.6233602166175842
+    },
+    "panda_hand": {
+      "peak_logit": 0.23785993456840515,
+      "peak_sigmoid": 0.5591861605644226
+    }
+  }
+}
