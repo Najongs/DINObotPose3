@@ -23,6 +23,9 @@ from tqdm import tqdm
 from PIL import Image
 import torchvision.transforms as transforms
 import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # Import DREAM utilities
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../DREAM')))
@@ -30,8 +33,9 @@ import dream
 from dream import analysis as dream_analysis
 
 # Import model from TRAIN directory
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../Train')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../TRAIN')))
 from model import DINOv3PoseEstimator, panda_forward_kinematics
+from checkpoint_compat import load_checkpoint_compat
 
 
 def _ensure_panda_angles_7(joint_angles_tensor: torch.Tensor, fix_joint7_zero: bool = False) -> torch.Tensor:
@@ -540,6 +544,7 @@ def compute_robopepp_style_pnp_add_metrics(
     conf_step: float = 0.025,
     pnp_min_span_px: float = 20.0,
     pnp_min_area_ratio: float = 0.001,
+    return_raw_adds: bool = False,
 ) -> Dict:
     """
     RoboPEPP-style PnP ADD:
@@ -600,12 +605,171 @@ def compute_robopepp_style_pnp_add_metrics(
         except Exception:
             pnp_adds.append(pnp_magic_number)
 
-    return compute_pnp_metrics(
+    metrics = compute_pnp_metrics(
         pnp_add=pnp_adds,
         num_inframe_projs_gt=num_inframe_projs_gt,
         add_auc_threshold=add_auc_threshold,
         pnp_magic_number=pnp_magic_number,
     )
+    if return_raw_adds:
+        return metrics, pnp_adds
+    return metrics
+
+
+def collect_keypoint_l2_errors(
+    kp_detected: np.ndarray,
+    kp_gt: np.ndarray,
+    image_resolution: Tuple[int, int],
+) -> Tuple[np.ndarray, int]:
+    """Collect valid in-frame 2D keypoint L2 errors and denominator used for PCK/AUC."""
+    kp_l2_errors = []
+    num_gt_inframe = 0
+    img_w, img_h = image_resolution
+
+    for kp_det, kp_g in zip(kp_detected, kp_gt):
+        if (0.0 <= kp_g[0] <= img_w) and (0.0 <= kp_g[1] <= img_h):
+            num_gt_inframe += 1
+            if kp_det[0] > -999.0 and kp_det[1] > -999.0:
+                kp_l2_errors.append(float(np.linalg.norm(kp_det - kp_g)))
+
+    return np.array(kp_l2_errors, dtype=np.float64), int(num_gt_inframe)
+
+
+def collect_direct_add_values(
+    pred_3d_all: np.ndarray,
+    gt_3d_all: np.ndarray,
+    gt_2d_all: np.ndarray,
+    image_resolution: Tuple[int, int],
+) -> np.ndarray:
+    """Collect per-frame direct ADD values (camera frame) with same validity as metric computation."""
+    frame_adds = []
+    img_w, img_h = image_resolution
+
+    for pred_3d, gt_3d, gt_2d in zip(pred_3d_all, gt_3d_all, gt_2d_all):
+        has_2d = (gt_2d[:, 0] > -900.0) & (gt_2d[:, 1] > -900.0)
+        in_frame = (
+            (gt_2d[:, 0] >= 0.0) & (gt_2d[:, 0] <= img_w) &
+            (gt_2d[:, 1] >= 0.0) & (gt_2d[:, 1] <= img_h)
+        )
+        has_3d = np.any(gt_3d != 0, axis=-1)
+        valid = has_2d & in_frame & has_3d
+        if np.count_nonzero(valid) == 0:
+            continue
+        frame_adds.append(float(np.mean(np.linalg.norm(pred_3d[valid] - gt_3d[valid], axis=-1))))
+
+    return np.array(frame_adds, dtype=np.float64)
+
+
+def build_auc_curve(
+    values: np.ndarray,
+    x_max: float,
+    denominator: int,
+    invalid_magic: float = None,
+    num_points: int = 500,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build threshold-success curve used for AUC plots.
+    y(x) = count(values <= x) / denominator.
+    """
+    if x_max <= 0.0 or denominator <= 0:
+        return np.array([]), np.array([])
+
+    arr = np.array(values, dtype=np.float64).reshape(-1)
+    if invalid_magic is not None:
+        arr = arr[arr > invalid_magic]
+    arr = arr[np.isfinite(arr)]
+
+    xs = np.linspace(0.0, float(x_max), int(num_points))
+    if arr.size == 0:
+        ys = np.zeros_like(xs)
+    else:
+        ys = np.array([np.count_nonzero(arr <= x) / float(denominator) for x in xs], dtype=np.float64)
+    return xs, ys
+
+
+def save_metric_plots(
+    output_dir: Path,
+    kp_errors: np.ndarray,
+    kp_denom: int,
+    kp_auc_threshold: float,
+    pnp_adds_dream: List[float],
+    pnp_adds_robopepp: List[float],
+    num_pnp_possible: int,
+    direct_adds: np.ndarray,
+    add_auc_threshold: float,
+    pred_3d_source: str,
+) -> List[str]:
+    """Save AUC/PCK plots and return generated file paths."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    saved_files = []
+
+    # 1) PCK curve (2D)
+    x_kp, y_kp = build_auc_curve(kp_errors, kp_auc_threshold, kp_denom, invalid_magic=None, num_points=600)
+    if x_kp.size > 0:
+        fig, ax = plt.subplots(figsize=(7.5, 5.0))
+        ax.plot(x_kp, y_kp * 100.0, linewidth=2.5, color="#0072B2", label="PCK curve")
+        for thr in (2.5, 5.0, 10.0):
+            if thr <= kp_auc_threshold:
+                val = np.count_nonzero(kp_errors <= thr) / float(kp_denom) if kp_denom > 0 else 0.0
+                ax.scatter([thr], [val * 100.0], color="#D55E00", s=28, zorder=3)
+        ax.set_title("2D Keypoint PCK Curve (AUC basis)")
+        ax.set_xlabel("Pixel threshold (px)")
+        ax.set_ylabel("PCK (%)")
+        ax.set_xlim(0.0, kp_auc_threshold)
+        ax.set_ylim(0.0, 100.0)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="lower right")
+        fig.tight_layout()
+        out_path = output_dir / "auc_curve_pck_2d.png"
+        fig.savefig(out_path, dpi=160)
+        plt.close(fig)
+        saved_files.append(str(out_path))
+
+    # 2) ADD curves (camera frame): DREAM PnP + RoboPEPP PnP + Direct ADD
+    x_add_dream, y_add_dream = build_auc_curve(
+        np.array(pnp_adds_dream, dtype=np.float64),
+        add_auc_threshold,
+        num_pnp_possible,
+        invalid_magic=-999.0,
+        num_points=600,
+    )
+    x_add_robo, y_add_robo = build_auc_curve(
+        np.array(pnp_adds_robopepp, dtype=np.float64),
+        add_auc_threshold,
+        num_pnp_possible,
+        invalid_magic=-999.0,
+        num_points=600,
+    )
+    x_add_direct, y_add_direct = build_auc_curve(
+        np.array(direct_adds, dtype=np.float64),
+        add_auc_threshold,
+        int(len(direct_adds)),
+        invalid_magic=None,
+        num_points=600,
+    )
+
+    if x_add_dream.size > 0 or x_add_robo.size > 0 or x_add_direct.size > 0:
+        fig, ax = plt.subplots(figsize=(8.5, 5.5))
+        if x_add_robo.size > 0:
+            ax.plot(x_add_robo, y_add_robo * 100.0, linewidth=2.5, color="#009E73", label="PnP ADD - RoboPEPP")
+        if x_add_dream.size > 0:
+            ax.plot(x_add_dream, y_add_dream * 100.0, linewidth=2.5, color="#CC79A7", label="PnP ADD - DREAM baseline")
+        if x_add_direct.size > 0:
+            ax.plot(x_add_direct, y_add_direct * 100.0, linewidth=2.5, color="#E69F00", label=f"Direct ADD - {pred_3d_source} source")
+        ax.set_title("ADD Curves (camera-frame, AUC basis)")
+        ax.set_xlabel("ADD threshold (m)")
+        ax.set_ylabel("Success rate (%)")
+        ax.set_xlim(0.0, add_auc_threshold)
+        ax.set_ylim(0.0, 100.0)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="lower right")
+        fig.tight_layout()
+        out_path = output_dir / "auc_curve_add_camera_frame.png"
+        fig.savefig(out_path, dpi=160)
+        plt.close(fig)
+        saved_files.append(str(out_path))
+
+    return saved_files
 
 
 def load_camera_from_first_frame(dataset_dir: Path) -> Tuple[np.ndarray, Tuple[int, int]]:
@@ -753,42 +917,12 @@ def run_inference(args):
         fix_joint7_zero=fix_joint7_zero,
     ).to(device)
 
-    # Load checkpoint
-    checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
-
-    if 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-        if is_main_process:
-            print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
-    else:
-        state_dict = checkpoint
-
-    # Handle DDP wrapper (module. prefix)
-    if any(k.startswith('module.') for k in state_dict.keys()):
-        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-
-    # Remove mask_token if shape mismatch (transformers version difference)
-    if 'backbone.model.embeddings.mask_token' in state_dict:
-        mask_token_shape = state_dict['backbone.model.embeddings.mask_token'].shape
-        if len(mask_token_shape) == 3 and mask_token_shape[1] == 1:
-            # Old format: (1, 1, 768) - remove to avoid mismatch
-            if is_main_process:
-                print(f"Removing mask_token from state_dict due to shape mismatch (transformers version difference)")
-            del state_dict['backbone.model.embeddings.mask_token']
-
-    # Drop shape-mismatched keys (e.g., switching joint-angle head 7->6 outputs).
-    model_state = model.state_dict()
-    filtered_state = {}
-    dropped = []
-    for k, v in state_dict.items():
-        if k in model_state and model_state[k].shape == v.shape:
-            filtered_state[k] = v
-        elif k in model_state:
-            dropped.append(k)
-    if is_main_process and dropped:
-        print(f"Dropping {len(dropped)} mismatched checkpoint keys (shape mismatch)")
-
-    model.load_state_dict(filtered_state, strict=False)
+    load_checkpoint_compat(
+        model=model,
+        checkpoint_path=args.model_path,
+        device=device,
+        is_main_process=is_main_process,
+    )
 
     model.eval()
 
@@ -1058,7 +1192,7 @@ def run_inference(args):
 
     # ===== RoboPEPP-style PnP ADD: pred 2D + pred robot 3D + K =====
     print("Computing RoboPEPP-style PnP ADD metrics (pred 2D + pred robot 3D + K)...")
-    robopepp_pnp_metrics = compute_robopepp_style_pnp_add_metrics(
+    robopepp_pnp_metrics, robopepp_pnp_adds = compute_robopepp_style_pnp_add_metrics(
         pred_2d_all=all_kp_projs_detected,
         pred_3d_robot_all=all_pred_3d_robot,
         gt_3d_all=all_kp_pos_gt,
@@ -1072,6 +1206,7 @@ def run_inference(args):
         conf_step=args.robopepp_pnp_conf_step,
         pnp_min_span_px=args.pnp_min_span_px,
         pnp_min_area_ratio=args.pnp_min_area_ratio,
+        return_raw_adds=True,
     )
 
     # Print results
@@ -1170,6 +1305,36 @@ def run_inference(args):
     if args.output_dir:
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Optional: save AUC/PCK plots.
+        if args.save_metric_plots:
+            kp_l2_errors, kp_denom = collect_keypoint_l2_errors(
+                all_kp_projs_detected.reshape(n_samples * len(keypoint_names), 2),
+                all_kp_projs_gt.reshape(n_samples * len(keypoint_names), 2),
+                raw_resolution,
+            )
+            direct_add_values = collect_direct_add_values(
+                all_pred_3d,
+                all_kp_pos_gt,
+                all_kp_projs_gt,
+                raw_resolution,
+            )
+            metric_plot_paths = save_metric_plots(
+                output_dir=output_dir,
+                kp_errors=kp_l2_errors,
+                kp_denom=kp_denom,
+                kp_auc_threshold=args.kp_auc_threshold,
+                pnp_adds_dream=pnp_adds,
+                pnp_adds_robopepp=robopepp_pnp_adds,
+                num_pnp_possible=int(pnp_metrics.get('num_pnp_possible', 0)),
+                direct_adds=direct_add_values,
+                add_auc_threshold=args.add_auc_threshold,
+                pred_3d_source=args.pred_3d_source,
+            )
+            if metric_plot_paths:
+                print("Saved metric plots:")
+                for p in metric_plot_paths:
+                    print(f"  - {p}")
 
         results = {
             'dataset': str(args.dataset_dir),
@@ -1339,6 +1504,8 @@ def main():
     # Output
     parser.add_argument('--output-dir', type=str, default=None,
                         help='Output directory for results')
+    parser.add_argument('--save-metric-plots', action='store_true', default=False,
+                        help='Save PCK/AUC and ADD/AUC plots into output directory')
     parser.add_argument('--save-per-frame-errors', action='store_true', default=False,
                         help='Save per-frame 3D error report and top-k outliers')
     parser.add_argument('--outlier-topk', type=int, default=100,

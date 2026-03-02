@@ -24,8 +24,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../DREA
 import dream
 
 # Import model from Train directory
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../Train')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../TRAIN')))
 from model import DINOv3PoseEstimator
+from checkpoint_compat import load_checkpoint_compat
 
 
 def _resolve_robopepp_urdf(explicit_urdf_path=None):
@@ -505,32 +506,13 @@ def network_inference(args):
 
     # Load checkpoint
     print(f"# Loading weights: {args.model_path}")
-    checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
-
-    state_dict = checkpoint.get('model_state_dict', checkpoint)
-    if any(k.startswith('module.') for k in state_dict.keys()):
-        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-    if 'backbone.model.embeddings.mask_token' in state_dict:
-        mask_shape = state_dict['backbone.model.embeddings.mask_token'].shape
-        if len(mask_shape) == 3 and mask_shape[1] == 1:
-            del state_dict['backbone.model.embeddings.mask_token']
-
-    # Drop shape-mismatched keys (e.g., 7-angle ckpt loaded into 6-angle head model).
-    model_state = model.state_dict()
-    filtered_state = {}
-    dropped = []
-    for k, v in state_dict.items():
-        if k in model_state and model_state[k].shape == v.shape:
-            filtered_state[k] = v
-        elif k in model_state:
-            dropped.append(k)
-    if dropped:
-        print(f"# Dropping {len(dropped)} mismatched checkpoint keys (shape mismatch)")
-
-    model.load_state_dict(filtered_state, strict=False)
+    load_checkpoint_compat(
+        model=model,
+        checkpoint_path=args.model_path,
+        device=device,
+        is_main_process=True,
+    )
     model.eval()
-    if 'epoch' in checkpoint:
-        print(f"# Checkpoint epoch: {checkpoint['epoch']}")
 
     # Load and preprocess image
     image_pil = PILImage.open(image_path).convert("RGB")

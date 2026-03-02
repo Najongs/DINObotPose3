@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Model and dataset
-MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/dinov3_base_20260301_045023/epoch_40.pth"
+MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/*dinov3_base_20260302_190422/*best_model_total_3d.pth"
 DATASET_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"
 
 # Output
@@ -52,6 +52,7 @@ if [ "${INFER_MODE}" = "single_gpu" ]; then
         --robopepp-pnp-conf-step 0.025 \
         --kp-auc-threshold $KP_AUC_THRESHOLD \
         --add-auc-threshold $ADD_AUC_THRESHOLD \
+        --save-metric-plots \
         --save-per-frame-errors \
         --outlier-topk $OUTLIER_TOPK
 elif [ "${INFER_MODE}" = "multi_gpu" ]; then
@@ -79,6 +80,7 @@ elif [ "${INFER_MODE}" = "multi_gpu" ]; then
         --robopepp-pnp-conf-step 0.025 \
         --kp-auc-threshold $KP_AUC_THRESHOLD \
         --add-auc-threshold $ADD_AUC_THRESHOLD \
+        --save-metric-plots \
         --save-per-frame-errors \
         --outlier-topk $OUTLIER_TOPK
 else
@@ -89,6 +91,8 @@ fi
 echo "Outlier analysis completed."
 echo "Check files in: ${OUTPUT_DIR}"
 echo "  - eval_results.json"
+echo "  - auc_curve_pck_2d.png"
+echo "  - auc_curve_add_camera_frame.png"
 echo "  - per_frame_3d_errors.json"
 echo "  - outlier_topk_3d_errors.json"
 echo "  - outlier_topk_json_names.txt"
