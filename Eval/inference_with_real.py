@@ -20,11 +20,16 @@ import yaml
 import cv2
 
 # Import DREAM utilities
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../DREAM')))
-import dream
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "/home/najo/NAS/DIP/DINObotPose/DREAM")))
+try:
+    import dream  # type: ignore
+    DREAM_AVAILABLE = True
+except Exception:
+    dream = None
+    DREAM_AVAILABLE = False
 
 # Import model from Train directory
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../Train')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../TRAIN')))
 from model import DINOv3PoseEstimator
 
 
@@ -32,13 +37,13 @@ def _resolve_robopepp_urdf(explicit_urdf_path=None):
     if explicit_urdf_path:
         return explicit_urdf_path
     return os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "../RoboPEPP/urdfs/Panda/panda.urdf")
+        os.path.join(os.path.dirname(__file__), "/home/najo/NAS/DIP/DINObotPose/RoboPEPP/urdfs/Panda/panda.urdf")
     )
 
 
 def _load_robopepp_panda_fk_class():
     module_path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "../RoboPEPP/models/robot_arm.py")
+        os.path.join(os.path.dirname(__file__), "/home/najo/NAS/DIP/DINObotPose/RoboPEPP/models/robot_arm.py")
     )
     spec = importlib.util.spec_from_file_location("robopepp_robot_arm", module_path)
     if spec is None or spec.loader is None:
@@ -819,106 +824,110 @@ def network_inference(args):
 
         # 1. GT (green) + Pred (red) on image
         overlay = image_resized.copy()
-        if gt_2d_input_valid:
-            overlay = dream.image_proc.overlay_points_on_image(
-                overlay, gt_2d_input_valid, gt_names_valid,
-                annotation_color_dot="green", annotation_color_text="white",
-            )
-        if pred_2d_input_valid:
-            overlay = dream.image_proc.overlay_points_on_image(
-                overlay, pred_2d_input_valid, pred_2d_input_valid_names,
-                annotation_color_dot="red", annotation_color_text="white",
-            )
-        out_path = os.path.join(args.output_dir, "01_gt_vs_pred_keypoints.png")
-        overlay.save(out_path)
-        print(f"  Saved: {out_path}")
-
-        # 2. Belief map mosaic
-        gt_2d_heatmap_list = None
-        if any(found):
-            gt_2d_heatmap = gt_2d.copy()
-            gt_2d_heatmap[:, 0] *= heatmap_size / orig_dim[0]
-            gt_2d_heatmap[:, 1] *= heatmap_size / orig_dim[1]
-            gt_2d_heatmap_list = [gt_2d_heatmap[i].tolist() if found[i] else None
-                                  for i in range(len(keypoint_names))]
-
-        belief_map_images = dream.image_proc.images_from_belief_maps(
-            pred_heatmaps[0], normalization_method=6
-        )
-        belief_map_images_kp = []
-        for kp_idx in range(len(keypoint_names)):
-            points = []
-            colors = []
-            if np.isfinite(pred_2d_heatmap[kp_idx]).all() and (pred_2d_heatmap[kp_idx][0] > -900.0) and (pred_2d_heatmap[kp_idx][1] > -900.0):
-                points.append(pred_2d_heatmap[kp_idx])
-                colors.append("red")
-            if gt_2d_heatmap_list and gt_2d_heatmap_list[kp_idx] is not None:
-                points.insert(0, gt_2d_heatmap_list[kp_idx])
-                colors.insert(0, "green")
-            if points:
-                bm_kp = dream.image_proc.overlay_points_on_image(
-                    belief_map_images[kp_idx], points,
-                    annotation_color_dot=colors, annotation_color_text=colors,
-                    point_diameter=4,
-                )
-            else:
-                bm_kp = belief_map_images[kp_idx]
-            belief_map_images_kp.append(bm_kp)
-
-        n_cols = int(math.ceil(len(keypoint_names) / 2.0))
-        mosaic = dream.image_proc.mosaic_images(
-            belief_map_images_kp, rows=2, cols=n_cols,
-            inner_padding_px=10, fill_color_rgb=(0, 0, 0),
-        )
-        out_path = os.path.join(args.output_dir, "02_belief_map_mosaic.png")
-        mosaic.save(out_path)
-        print(f"  Saved: {out_path}")
-
-        # 3. Per-joint belief maps overlaid on image
-        blended_array = []
-        for n in range(len(keypoint_names)):
-            bm = belief_map_images[n].resize(input_dim, resample=PILImage.BILINEAR)
-            blended = PILImage.blend(image_resized, bm, alpha=0.5)
-            if np.isfinite(pred_2d_input[n]).all() and (pred_2d_input[n][0] > -900.0) and (pred_2d_input[n][1] > -900.0):
-                blended = dream.image_proc.overlay_points_on_image(
-                    blended, [pred_2d_input[n]], [keypoint_names[n]],
-                    annotation_color_dot="red", annotation_color_text="white",
-                )
-            if found[n]:
-                blended = dream.image_proc.overlay_points_on_image(
-                    blended, [gt_2d_input[n].tolist()], [keypoint_names[n]],
+        if DREAM_AVAILABLE:
+            if gt_2d_input_valid:
+                overlay = dream.image_proc.overlay_points_on_image(
+                    overlay, gt_2d_input_valid, gt_names_valid,
                     annotation_color_dot="green", annotation_color_text="white",
                 )
-            blended_array.append(blended)
+            if pred_2d_input_valid:
+                overlay = dream.image_proc.overlay_points_on_image(
+                    overlay, pred_2d_input_valid, pred_2d_input_valid_names,
+                    annotation_color_dot="red", annotation_color_text="white",
+                )
+            out_path = os.path.join(args.output_dir, "01_gt_vs_pred_keypoints.png")
+            overlay.save(out_path)
+            print(f"  Saved: {out_path}")
 
-        mosaic2 = dream.image_proc.mosaic_images(
-            blended_array, rows=2, cols=n_cols, fill_color_rgb=(0, 0, 0)
-        )
-        out_path = os.path.join(args.output_dir, "03_belief_maps_overlay_mosaic.png")
-        mosaic2.save(out_path)
-        print(f"  Saved: {out_path}")
+        # 2. Belief map mosaic
+        if DREAM_AVAILABLE:
+            gt_2d_heatmap_list = None
+            if any(found):
+                gt_2d_heatmap = gt_2d.copy()
+                gt_2d_heatmap[:, 0] *= heatmap_size / orig_dim[0]
+                gt_2d_heatmap[:, 1] *= heatmap_size / orig_dim[1]
+                gt_2d_heatmap_list = [gt_2d_heatmap[i].tolist() if found[i] else None
+                                      for i in range(len(keypoint_names))]
 
-        # 4. Combined belief map on original image
-        belief_combined = pred_heatmaps[0].sum(dim=0)
-        belief_combined_img = dream.image_proc.image_from_belief_map(
-            belief_combined, normalization_method=6
-        )
-        belief_orig = belief_combined_img.resize(orig_dim, resample=PILImage.BILINEAR)
-        orig_overlay = PILImage.blend(image_pil, belief_orig, alpha=0.5)
-        if any(found):
-            gt_valid_orig = [gt_2d[i].tolist() for i in range(len(keypoint_names)) if found[i]]
-            orig_overlay = dream.image_proc.overlay_points_on_image(
-                orig_overlay, gt_valid_orig, gt_names_valid,
-                annotation_color_dot="green", annotation_color_text="white",
+            belief_map_images = dream.image_proc.images_from_belief_maps(
+                pred_heatmaps[0], normalization_method=6
             )
-        if pred_2d_orig_valid:
-            orig_overlay = dream.image_proc.overlay_points_on_image(
-                orig_overlay, pred_2d_orig_valid, pred_2d_orig_valid_names,
-                annotation_color_dot="red", annotation_color_text="white",
+            belief_map_images_kp = []
+            for kp_idx in range(len(keypoint_names)):
+                points = []
+                colors = []
+                if np.isfinite(pred_2d_heatmap[kp_idx]).all() and (pred_2d_heatmap[kp_idx][0] > -900.0) and (pred_2d_heatmap[kp_idx][1] > -900.0):
+                    points.append(pred_2d_heatmap[kp_idx])
+                    colors.append("red")
+                if gt_2d_heatmap_list and gt_2d_heatmap_list[kp_idx] is not None:
+                    points.insert(0, gt_2d_heatmap_list[kp_idx])
+                    colors.insert(0, "green")
+                if points:
+                    bm_kp = dream.image_proc.overlay_points_on_image(
+                        belief_map_images[kp_idx], points,
+                        annotation_color_dot=colors, annotation_color_text=colors,
+                        point_diameter=4,
+                    )
+                else:
+                    bm_kp = belief_map_images[kp_idx]
+                belief_map_images_kp.append(bm_kp)
+
+            n_cols = int(math.ceil(len(keypoint_names) / 2.0))
+            mosaic = dream.image_proc.mosaic_images(
+                belief_map_images_kp, rows=2, cols=n_cols,
+                inner_padding_px=10, fill_color_rgb=(0, 0, 0),
             )
-        out_path = os.path.join(args.output_dir, "04_combined_on_original.png")
-        orig_overlay.save(out_path)
-        print(f"  Saved: {out_path}")
+            out_path = os.path.join(args.output_dir, "02_belief_map_mosaic.png")
+            mosaic.save(out_path)
+            print(f"  Saved: {out_path}")
+
+            # 3. Per-joint belief maps overlaid on image
+            blended_array = []
+            for n in range(len(keypoint_names)):
+                bm = belief_map_images[n].resize(input_dim, resample=PILImage.BILINEAR)
+                blended = PILImage.blend(image_resized, bm, alpha=0.5)
+                if np.isfinite(pred_2d_input[n]).all() and (pred_2d_input[n][0] > -900.0) and (pred_2d_input[n][1] > -900.0):
+                    blended = dream.image_proc.overlay_points_on_image(
+                        blended, [pred_2d_input[n]], [keypoint_names[n]],
+                        annotation_color_dot="red", annotation_color_text="white",
+                    )
+                if found[n]:
+                    blended = dream.image_proc.overlay_points_on_image(
+                        blended, [gt_2d_input[n].tolist()], [keypoint_names[n]],
+                        annotation_color_dot="green", annotation_color_text="white",
+                    )
+                blended_array.append(blended)
+
+            mosaic2 = dream.image_proc.mosaic_images(
+                blended_array, rows=2, cols=n_cols, fill_color_rgb=(0, 0, 0)
+            )
+            out_path = os.path.join(args.output_dir, "03_belief_maps_overlay_mosaic.png")
+            mosaic2.save(out_path)
+            print(f"  Saved: {out_path}")
+
+            # 4. Combined belief map on original image
+            belief_combined = pred_heatmaps[0].sum(dim=0)
+            belief_combined_img = dream.image_proc.image_from_belief_map(
+                belief_combined, normalization_method=6
+            )
+            belief_orig = belief_combined_img.resize(orig_dim, resample=PILImage.BILINEAR)
+            orig_overlay = PILImage.blend(image_pil, belief_orig, alpha=0.5)
+            if any(found):
+                gt_valid_orig = [gt_2d[i].tolist() for i in range(len(keypoint_names)) if found[i]]
+                orig_overlay = dream.image_proc.overlay_points_on_image(
+                    orig_overlay, gt_valid_orig, gt_names_valid,
+                    annotation_color_dot="green", annotation_color_text="white",
+                )
+            if pred_2d_orig_valid:
+                orig_overlay = dream.image_proc.overlay_points_on_image(
+                    orig_overlay, pred_2d_orig_valid, pred_2d_orig_valid_names,
+                    annotation_color_dot="red", annotation_color_text="white",
+                )
+            out_path = os.path.join(args.output_dir, "04_combined_on_original.png")
+            orig_overlay.save(out_path)
+            print(f"  Saved: {out_path}")
+        else:
+            print("  Warning: DREAM not available. Skipping visualizations.")
 
         # 5. Save metrics to JSON
         metrics_path = os.path.join(args.output_dir, "metrics.json")

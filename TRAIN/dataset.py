@@ -441,23 +441,27 @@ class PoseEstimationDataset(Dataset):
         if 'objects' in data:
             for obj in data['objects']:
                 if 'keypoints' in obj:
-                    # Create a mapping from name to position in JSON
                     for kp in obj['keypoints']:
                         kp_name = kp['name']
-                        if kp_name in self.keypoint_names:
-                            # Find the index in our ordered list
-                            idx = self.keypoint_names.index(kp_name)
-                            keypoint_positions[idx] = [
+                        # 부분 일치 검사 (예: 'panda_link0'에서 'link0' 찾기)
+                        target_idx = -1
+                        for i, name in enumerate(self.keypoint_names):
+                            if name in kp_name:
+                                target_idx = i
+                                break
+                        
+                        if target_idx != -1:
+                            keypoint_positions[target_idx] = [
                                 kp['projected_location'][0],
                                 kp['projected_location'][1]
                             ]
                             if 'location' in kp:
-                                keypoint_positions_3d[idx] = [
+                                keypoint_positions_3d[target_idx] = [
                                     kp['location'][0],
                                     kp['location'][1],
                                     kp['location'][2]
                                 ]
-                            keypoint_found[idx] = True
+                            keypoint_found[target_idx] = True
 
         # Mark missing keypoints with negative coordinates
         for i, found in enumerate(keypoint_found):
@@ -485,27 +489,30 @@ class PoseEstimationDataset(Dataset):
 
     def _create_heatmap(self, keypoints: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
         """
-        Keypoint 위치로부터 Gaussian heatmap 생성
-
-        Args:
-            keypoints: (N, 2) keypoint 좌표 [x, y]
-            size: (H, W) heatmap 크기
-
-        Returns:
-            heatmaps: (N, H, W) Gaussian heatmap
+        Keypoint 위치로부터 Gaussian heatmap 생성 (최적화 버전)
         """
         H, W = size
         num_keypoints = len(keypoints)
         heatmaps = np.zeros((num_keypoints, H, W), dtype=np.float32)
 
+        # meshgrid를 한 번만 생성
+        x_range = np.arange(W)
+        y_range = np.arange(H)
+        xx, yy = np.meshgrid(x_range, y_range)
+
         for i, (x, y) in enumerate(keypoints):
-            # 이미지 크기에 맞게 keypoint 좌표 스케일링
-            if x < 0 or y < 0:  # Invalid keypoint
+            # 이미지 범위를 벗어난 키포인트 처리 (Albumentations 이후 대비)
+            if x < 0 or y < 0 or x >= W or y >= H:
                 continue
 
             # Gaussian 생성
-            xx, yy = np.meshgrid(np.arange(W), np.arange(H))
-            heatmap = np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * self.sigma ** 2))
+            # sigma가 너무 작으면 학습이 안 되므로 최소값 보장
+            sigma = max(self.sigma, 1.0)
+            d2 = (xx - x) ** 2 + (yy - y) ** 2
+            heatmap = np.exp(-d2 / (2 * sigma ** 2))
+            
+            # 아주 작은 값은 0으로 처리하여 sparsity 확보
+            heatmap[heatmap < 0.01] = 0
             heatmaps[i] = heatmap
 
         return heatmaps

@@ -8,14 +8,14 @@
 # =============================================================================
 
 # Data paths (REQUIRED - Update these paths!)
-DATA_DIRS=("/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM" "/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn")
-VAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/TOTAL/DREAM_to_DREAM/panda-3cam_azure"  
+DATA_DIRS=("/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_test_dr")
+VAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"  
 
 # DATA_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
 # VAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"  # Validation data directory (separate from training)
 
 TRAIN_SPLIT=1.0  # Train split ratio (1.0 = use all training data when VAL_DIR is specified)
-VAL_SPLIT=1  # Validation data usage ratio (0.1 = use 10% of validation data)
+VAL_SPLIT=0.2  # Validation data usage ratio (0.1 = use 10% of validation data)
 TRAIN_JSON_LIST=""  # e.g. /data/public/NAS/DINObotPose2/Eval/eval_outputs_outlier/outlier_topk_json_paths.txt
 TRAIN_JSON_LIST_MODE="extra"  # extra: full train + json-list extra pass per epoch, filter: only json list
 TRAIN_JSON_EXTRA_LOSS_SCALE=1.0
@@ -52,16 +52,16 @@ KP3D_WEIGHT=100.0
 HEATMAP_ONLY_TRAIN=True  # True: train only 2D heatmap branch
 
 # FDA (Fourier Domain Adaptation) for sim-to-real
-FDA_REAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_real"  # Real images (no labels needed)
+FDA_REAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"  # Real images (no labels needed)
 # FDA_REAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_real"
-FDA_BETA=0.001   # Low-freq replacement ratio (0.01=subtle tone shift, 0.05=strong)
+FDA_BETA=0.05   # Low-freq replacement ratio (0.01=subtle tone shift, 0.05=strong)
 FDA_PROB=0.5   # Probability of applying FDA per sample (0.0 to disable)
-OCCLUSION_PROB=0.2          # CoarseDropout probability for occlusion robustness
+OCCLUSION_PROB=0.0          # CoarseDropout probability for occlusion robustness
 OCCLUSION_MAX_HOLES=3       # Maximum occlusion patches per image
 OCCLUSION_MAX_SIZE_FRAC=0.2 # Max patch size ratio (image side fraction)
 
 # Training hyperparameters
-EPOCHS=50
+EPOCHS=30
 BATCH_SIZE=16
 NUM_WORKERS=4
 OPTIMIZER="adam"  # Options: adam, adamw, sgd
@@ -88,10 +88,10 @@ WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 
 # Other settings
 SEED=42
-RESUME="/home/najo/NAS/DIP/DINObotPose2/Train/outputs/dinov3_base_20260302_180056/epoch_1.pth"  # Path to checkpoint for resuming (leave empty for new training)
+RESUME=""  # Path to checkpoint for resuming (leave empty for new training)
 RESUME_LR=""  # Learning rate to use when resuming (leave empty for automatic calculation from scheduler)
 LOAD_2D_HEAD=""  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
-FREEZE_2D_HEAD_EPOCHS=50  # If LOAD_2D_HEAD is set, freeze loaded 2D head for first N epochs then unfreeze
+FREEZE_2D_HEAD_EPOCHS=30  # If LOAD_2D_HEAD is set, freeze loaded 2D head for first N epochs then unfreeze
 
 # =============================================================================
 # Training Modes

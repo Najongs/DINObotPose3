@@ -11,7 +11,7 @@ import os
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -23,15 +23,23 @@ from tqdm import tqdm
 from PIL import Image
 import torchvision.transforms as transforms
 import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-# Import DREAM utilities
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../DREAM')))
-import dream
-from dream import analysis as dream_analysis
+# Optional DREAM utilities (fallback to OpenCV-only path when unavailable)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../DREAM")))
+try:
+    import dream  # type: ignore
+    DREAM_AVAILABLE = True
+except Exception:
+    dream = None
+    DREAM_AVAILABLE = False
 
 # Import model from TRAIN directory
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../Train')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../TRAIN')))
 from model import DINOv3PoseEstimator, panda_forward_kinematics
+from checkpoint_compat import load_checkpoint_compat
 
 
 def _ensure_panda_angles_7(joint_angles_tensor: torch.Tensor, fix_joint7_zero: bool = False) -> torch.Tensor:
@@ -229,7 +237,71 @@ def passes_pnp_spread_check(points_2d: np.ndarray, image_resolution: Tuple[int, 
     )
 
 
-def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
+def _optimize_translation_z_for_reprojection(
+    robot_kpts: np.ndarray,
+    pred_2d: np.ndarray,
+    camera_K: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    z_min_m: float = -0.05,
+    z_max_m: float = 0.05,
+    z_step_m: float = 0.001,
+    min_points: int = 4,
+) -> Tuple[np.ndarray, Optional[float], float]:
+    """Post-PnP Z-only search that minimizes 2D reprojection error."""
+    valid = (
+        np.isfinite(robot_kpts).all(axis=1)
+        & np.isfinite(pred_2d).all(axis=1)
+        & (pred_2d[:, 0] > -900.0)
+        & (pred_2d[:, 1] > -900.0)
+    )
+    idx = np.where(valid)[0]
+    if idx.shape[0] < int(min_points):
+        return np.array(tvec, dtype=np.float64).reshape(3, 1), None, 0.0
+
+    obj_valid = robot_kpts[idx].astype(np.float64)
+    img_valid = pred_2d[idx].astype(np.float64)
+    K = camera_K.astype(np.float64)
+    rv = np.array(rvec, dtype=np.float64).reshape(3, 1)
+    t_base = np.array(tvec, dtype=np.float64).reshape(3)
+
+    step = float(z_step_m)
+    if step <= 0.0:
+        return t_base.reshape(3, 1), None, 0.0
+
+    z_lo = float(z_min_m)
+    z_hi = float(z_max_m)
+    if z_hi < z_lo:
+        z_lo, z_hi = z_hi, z_lo
+
+    candidates = np.arange(z_lo, z_hi + 0.5 * step, step, dtype=np.float64)
+    best_t = t_base.copy()
+    best_err = None
+    best_offset = 0.0
+
+    for dz in candidates:
+        t_try = t_base.copy()
+        t_try[2] += float(dz)
+        proj, _ = cv2.projectPoints(obj_valid, rv, t_try.reshape(3, 1), K, None)
+        proj = proj.reshape(-1, 2)
+        err = float(np.mean(np.linalg.norm(proj - img_valid, axis=1)))
+        if (best_err is None) or (err < best_err):
+            best_err = err
+            best_t = t_try
+            best_offset = float(dz)
+
+    return best_t.reshape(3, 1), best_err, best_offset
+
+
+def transform_robot_to_camera(
+    robot_kpts,
+    pred_2d,
+    camera_K,
+    apply_z_search: bool = False,
+    z_search_min_m: float = -0.05,
+    z_search_max_m: float = 0.05,
+    z_search_step_m: float = 0.001,
+):
     """
     Transform robot frame keypoints to camera frame using EPnP.
 
@@ -271,6 +343,19 @@ def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
         if not success:
             return None, None
 
+        if apply_z_search:
+            tvec, _, _ = _optimize_translation_z_for_reprojection(
+                robot_kpts=robot_kpts,
+                pred_2d=pred_2d,
+                camera_K=camera_K,
+                rvec=rvec,
+                tvec=tvec,
+                z_min_m=z_search_min_m,
+                z_max_m=z_search_max_m,
+                z_step_m=z_search_step_m,
+                min_points=4,
+            )
+
         # Convert rotation vector to rotation matrix
         R, _ = cv2.Rodrigues(rvec)
         t = tvec.flatten()
@@ -283,6 +368,55 @@ def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
 
     except Exception as e:
         return None, None
+
+
+def solve_pnp_epnp_iterative(
+    points_3d: np.ndarray,
+    points_2d: np.ndarray,
+    camera_K: np.ndarray,
+) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray]]:
+    """OpenCV PnP fallback equivalent to DREAM-style EPnP(+iterative refine)."""
+    try:
+        ok, rvec, tvec = cv2.solvePnP(
+            points_3d.astype(np.float64),
+            points_2d.astype(np.float64),
+            camera_K.astype(np.float64),
+            None,
+            flags=cv2.SOLVEPNP_EPNP,
+        )
+        if not ok:
+            return False, None, None
+        ok, rvec, tvec = cv2.solvePnP(
+            points_3d.astype(np.float64),
+            points_2d.astype(np.float64),
+            camera_K.astype(np.float64),
+            None,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+            useExtrinsicGuess=True,
+            rvec=rvec,
+            tvec=tvec,
+        )
+        if not ok:
+            return False, None, None
+        return True, rvec, tvec
+    except Exception:
+        return False, None, None
+
+
+def add_from_pose_rvec_tvec(
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    points_3d: np.ndarray,
+) -> float:
+    """
+    ADD proxy without DREAM:
+    transform 3D points by solved pose and compare to original points.
+    """
+    R, _ = cv2.Rodrigues(np.array(rvec, dtype=np.float64).reshape(3, 1))
+    t = np.array(tvec, dtype=np.float64).reshape(3)
+    pts = np.array(points_3d, dtype=np.float64).reshape(-1, 3)
+    pts_tf = (R @ pts.T).T + t.reshape(1, 3)
+    return float(np.linalg.norm(pts_tf - pts, axis=1).mean())
 
 
 def compute_keypoint_metrics(
@@ -540,6 +674,11 @@ def compute_robopepp_style_pnp_add_metrics(
     conf_step: float = 0.025,
     pnp_min_span_px: float = 20.0,
     pnp_min_area_ratio: float = 0.001,
+    apply_z_search: bool = False,
+    z_search_min_m: float = -0.05,
+    z_search_max_m: float = 0.05,
+    z_search_step_m: float = 0.001,
+    return_raw_adds: bool = False,
 ) -> Dict:
     """
     RoboPEPP-style PnP ADD:
@@ -586,6 +725,19 @@ def compute_robopepp_style_pnp_add_metrics(
                 pnp_adds.append(pnp_magic_number)
                 continue
 
+            if apply_z_search:
+                tvec, _, _ = _optimize_translation_z_for_reprojection(
+                    robot_kpts=pred_3d_robot,
+                    pred_2d=pred_2d,
+                    camera_K=sample_K,
+                    rvec=rvec,
+                    tvec=tvec,
+                    z_min_m=z_search_min_m,
+                    z_max_m=z_search_max_m,
+                    z_step_m=z_search_step_m,
+                    min_points=min_points,
+                )
+
             R, _ = cv2.Rodrigues(rvec)
             t = tvec.flatten()
             pred_3d_cam = (R @ pred_3d_robot.T).T + t.reshape(1, 3)
@@ -600,12 +752,171 @@ def compute_robopepp_style_pnp_add_metrics(
         except Exception:
             pnp_adds.append(pnp_magic_number)
 
-    return compute_pnp_metrics(
+    metrics = compute_pnp_metrics(
         pnp_add=pnp_adds,
         num_inframe_projs_gt=num_inframe_projs_gt,
         add_auc_threshold=add_auc_threshold,
         pnp_magic_number=pnp_magic_number,
     )
+    if return_raw_adds:
+        return metrics, pnp_adds
+    return metrics
+
+
+def collect_keypoint_l2_errors(
+    kp_detected: np.ndarray,
+    kp_gt: np.ndarray,
+    image_resolution: Tuple[int, int],
+) -> Tuple[np.ndarray, int]:
+    """Collect valid in-frame 2D keypoint L2 errors and denominator used for PCK/AUC."""
+    kp_l2_errors = []
+    num_gt_inframe = 0
+    img_w, img_h = image_resolution
+
+    for kp_det, kp_g in zip(kp_detected, kp_gt):
+        if (0.0 <= kp_g[0] <= img_w) and (0.0 <= kp_g[1] <= img_h):
+            num_gt_inframe += 1
+            if kp_det[0] > -999.0 and kp_det[1] > -999.0:
+                kp_l2_errors.append(float(np.linalg.norm(kp_det - kp_g)))
+
+    return np.array(kp_l2_errors, dtype=np.float64), int(num_gt_inframe)
+
+
+def collect_direct_add_values(
+    pred_3d_all: np.ndarray,
+    gt_3d_all: np.ndarray,
+    gt_2d_all: np.ndarray,
+    image_resolution: Tuple[int, int],
+) -> np.ndarray:
+    """Collect per-frame direct ADD values (camera frame) with same validity as metric computation."""
+    frame_adds = []
+    img_w, img_h = image_resolution
+
+    for pred_3d, gt_3d, gt_2d in zip(pred_3d_all, gt_3d_all, gt_2d_all):
+        has_2d = (gt_2d[:, 0] > -900.0) & (gt_2d[:, 1] > -900.0)
+        in_frame = (
+            (gt_2d[:, 0] >= 0.0) & (gt_2d[:, 0] <= img_w) &
+            (gt_2d[:, 1] >= 0.0) & (gt_2d[:, 1] <= img_h)
+        )
+        has_3d = np.any(gt_3d != 0, axis=-1)
+        valid = has_2d & in_frame & has_3d
+        if np.count_nonzero(valid) == 0:
+            continue
+        frame_adds.append(float(np.mean(np.linalg.norm(pred_3d[valid] - gt_3d[valid], axis=-1))))
+
+    return np.array(frame_adds, dtype=np.float64)
+
+
+def build_auc_curve(
+    values: np.ndarray,
+    x_max: float,
+    denominator: int,
+    invalid_magic: float = None,
+    num_points: int = 500,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build threshold-success curve used for AUC plots.
+    y(x) = count(values <= x) / denominator.
+    """
+    if x_max <= 0.0 or denominator <= 0:
+        return np.array([]), np.array([])
+
+    arr = np.array(values, dtype=np.float64).reshape(-1)
+    if invalid_magic is not None:
+        arr = arr[arr > invalid_magic]
+    arr = arr[np.isfinite(arr)]
+
+    xs = np.linspace(0.0, float(x_max), int(num_points))
+    if arr.size == 0:
+        ys = np.zeros_like(xs)
+    else:
+        ys = np.array([np.count_nonzero(arr <= x) / float(denominator) for x in xs], dtype=np.float64)
+    return xs, ys
+
+
+def save_metric_plots(
+    output_dir: Path,
+    kp_errors: np.ndarray,
+    kp_denom: int,
+    kp_auc_threshold: float,
+    pnp_adds_dream: List[float],
+    pnp_adds_robopepp: List[float],
+    num_pnp_possible: int,
+    direct_adds: np.ndarray,
+    add_auc_threshold: float,
+    pred_3d_source: str,
+) -> List[str]:
+    """Save AUC/PCK plots and return generated file paths."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    saved_files = []
+
+    # 1) PCK curve (2D)
+    x_kp, y_kp = build_auc_curve(kp_errors, kp_auc_threshold, kp_denom, invalid_magic=None, num_points=600)
+    if x_kp.size > 0:
+        fig, ax = plt.subplots(figsize=(7.5, 5.0))
+        ax.plot(x_kp, y_kp * 100.0, linewidth=2.5, color="#0072B2", label="PCK curve")
+        for thr in (2.5, 5.0, 10.0):
+            if thr <= kp_auc_threshold:
+                val = np.count_nonzero(kp_errors <= thr) / float(kp_denom) if kp_denom > 0 else 0.0
+                ax.scatter([thr], [val * 100.0], color="#D55E00", s=28, zorder=3)
+        ax.set_title("2D Keypoint PCK Curve (AUC basis)")
+        ax.set_xlabel("Pixel threshold (px)")
+        ax.set_ylabel("PCK (%)")
+        ax.set_xlim(0.0, kp_auc_threshold)
+        ax.set_ylim(0.0, 100.0)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="lower right")
+        fig.tight_layout()
+        out_path = output_dir / "auc_curve_pck_2d.png"
+        fig.savefig(out_path, dpi=160)
+        plt.close(fig)
+        saved_files.append(str(out_path))
+
+    # 2) ADD curves (camera frame): DREAM PnP + RoboPEPP PnP + Direct ADD
+    x_add_dream, y_add_dream = build_auc_curve(
+        np.array(pnp_adds_dream, dtype=np.float64),
+        add_auc_threshold,
+        num_pnp_possible,
+        invalid_magic=-999.0,
+        num_points=600,
+    )
+    x_add_robo, y_add_robo = build_auc_curve(
+        np.array(pnp_adds_robopepp, dtype=np.float64),
+        add_auc_threshold,
+        num_pnp_possible,
+        invalid_magic=-999.0,
+        num_points=600,
+    )
+    x_add_direct, y_add_direct = build_auc_curve(
+        np.array(direct_adds, dtype=np.float64),
+        add_auc_threshold,
+        int(len(direct_adds)),
+        invalid_magic=None,
+        num_points=600,
+    )
+
+    if x_add_dream.size > 0 or x_add_robo.size > 0 or x_add_direct.size > 0:
+        fig, ax = plt.subplots(figsize=(8.5, 5.5))
+        if x_add_robo.size > 0:
+            ax.plot(x_add_robo, y_add_robo * 100.0, linewidth=2.5, color="#009E73", label="PnP ADD - RoboPEPP")
+        if x_add_dream.size > 0:
+            ax.plot(x_add_dream, y_add_dream * 100.0, linewidth=2.5, color="#CC79A7", label="PnP ADD - DREAM baseline")
+        if x_add_direct.size > 0:
+            ax.plot(x_add_direct, y_add_direct * 100.0, linewidth=2.5, color="#E69F00", label=f"Direct ADD - {pred_3d_source} source")
+        ax.set_title("ADD Curves (camera-frame, AUC basis)")
+        ax.set_xlabel("ADD threshold (m)")
+        ax.set_ylabel("Success rate (%)")
+        ax.set_xlim(0.0, add_auc_threshold)
+        ax.set_ylim(0.0, 100.0)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="lower right")
+        fig.tight_layout()
+        out_path = output_dir / "auc_curve_add_camera_frame.png"
+        fig.savefig(out_path, dpi=160)
+        plt.close(fig)
+        saved_files.append(str(out_path))
+
+    return saved_files
 
 
 def load_camera_from_first_frame(dataset_dir: Path) -> Tuple[np.ndarray, Tuple[int, int]]:
@@ -660,6 +971,8 @@ def run_inference(args):
     """Run inference on dataset and compute metrics"""
     is_distributed, rank, world_size, local_rank = setup_distributed(args.distributed)
     is_main_process = (not is_distributed) or (rank == 0)
+    if is_main_process and not DREAM_AVAILABLE:
+        print("Info: DREAM package not found. Using OpenCV fallback for PnP/ADD baseline.")
 
     dataset_dir = Path(args.dataset_dir)
     camera_K, raw_resolution = load_camera_from_first_frame(dataset_dir)
@@ -753,42 +1066,12 @@ def run_inference(args):
         fix_joint7_zero=fix_joint7_zero,
     ).to(device)
 
-    # Load checkpoint
-    checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
-
-    if 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-        if is_main_process:
-            print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
-    else:
-        state_dict = checkpoint
-
-    # Handle DDP wrapper (module. prefix)
-    if any(k.startswith('module.') for k in state_dict.keys()):
-        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-
-    # Remove mask_token if shape mismatch (transformers version difference)
-    if 'backbone.model.embeddings.mask_token' in state_dict:
-        mask_token_shape = state_dict['backbone.model.embeddings.mask_token'].shape
-        if len(mask_token_shape) == 3 and mask_token_shape[1] == 1:
-            # Old format: (1, 1, 768) - remove to avoid mismatch
-            if is_main_process:
-                print(f"Removing mask_token from state_dict due to shape mismatch (transformers version difference)")
-            del state_dict['backbone.model.embeddings.mask_token']
-
-    # Drop shape-mismatched keys (e.g., switching joint-angle head 7->6 outputs).
-    model_state = model.state_dict()
-    filtered_state = {}
-    dropped = []
-    for k, v in state_dict.items():
-        if k in model_state and model_state[k].shape == v.shape:
-            filtered_state[k] = v
-        elif k in model_state:
-            dropped.append(k)
-    if is_main_process and dropped:
-        print(f"Dropping {len(dropped)} mismatched checkpoint keys (shape mismatch)")
-
-    model.load_state_dict(filtered_state, strict=False)
+    load_checkpoint_compat(
+        model=model,
+        checkpoint_path=args.model_path,
+        device=device,
+        is_main_process=is_main_process,
+    )
 
     model.eval()
 
@@ -887,7 +1170,15 @@ def run_inference(args):
                 ):
                     pred_3d_camera, proj_2d_all = None, None
                 else:
-                    pred_3d_camera, proj_2d_all = transform_robot_to_camera(pred_3d_robot_sample, pred_kp_scaled, sample_camera_K)
+                    pred_3d_camera, proj_2d_all = transform_robot_to_camera(
+                        pred_3d_robot_sample,
+                        pred_kp_scaled,
+                        sample_camera_K,
+                        apply_z_search=(not args.disable_pnp_z_search),
+                        z_search_min_m=args.pnp_z_search_min_m,
+                        z_search_max_m=args.pnp_z_search_max_m,
+                        z_search_step_m=args.pnp_z_search_step_m,
+                    )
                 if pred_3d_camera is not None:
                     pred_3d_sample = pred_3d_camera
                     if args.fill_invalid_2d_with_fk_reproj and proj_2d_all is not None:
@@ -1030,21 +1321,33 @@ def run_inference(args):
                 pnp_adds.append(-999.0)
                 continue
 
-            # Solve PnP using DREAM wrapper (EPnP + optional refinement).
+            # Solve PnP using DREAM wrapper if available; otherwise OpenCV fallback.
             try:
-                success, translation, quaternion = dream.geometric_vision.solve_pnp(
-                    kp_3d_pnp.astype(np.float64),
-                    kp_det_pnp.astype(np.float64),
-                    sample_K.astype(np.float64),
-                )
-
-                if success:
-                    add = dream.geometric_vision.add_from_pose(
-                        translation, quaternion, kp_3d_pnp, sample_K
+                if DREAM_AVAILABLE:
+                    success, translation, quaternion = dream.geometric_vision.solve_pnp(
+                        kp_3d_pnp.astype(np.float64),
+                        kp_det_pnp.astype(np.float64),
+                        sample_K.astype(np.float64),
                     )
-                    pnp_adds.append(add)
+
+                    if success:
+                        add = dream.geometric_vision.add_from_pose(
+                            translation, quaternion, kp_3d_pnp, sample_K
+                        )
+                        pnp_adds.append(add)
+                    else:
+                        pnp_adds.append(-999.0)
                 else:
-                    pnp_adds.append(-999.0)
+                    success, rvec, tvec = solve_pnp_epnp_iterative(
+                        kp_3d_pnp,
+                        kp_det_pnp,
+                        sample_K,
+                    )
+                    if success and rvec is not None and tvec is not None:
+                        add = add_from_pose_rvec_tvec(rvec, tvec, kp_3d_pnp)
+                        pnp_adds.append(add)
+                    else:
+                        pnp_adds.append(-999.0)
             except Exception:
                 pnp_adds.append(-999.0)
         else:
@@ -1058,7 +1361,7 @@ def run_inference(args):
 
     # ===== RoboPEPP-style PnP ADD: pred 2D + pred robot 3D + K =====
     print("Computing RoboPEPP-style PnP ADD metrics (pred 2D + pred robot 3D + K)...")
-    robopepp_pnp_metrics = compute_robopepp_style_pnp_add_metrics(
+    robopepp_pnp_metrics, robopepp_pnp_adds = compute_robopepp_style_pnp_add_metrics(
         pred_2d_all=all_kp_projs_detected,
         pred_3d_robot_all=all_pred_3d_robot,
         gt_3d_all=all_kp_pos_gt,
@@ -1072,6 +1375,11 @@ def run_inference(args):
         conf_step=args.robopepp_pnp_conf_step,
         pnp_min_span_px=args.pnp_min_span_px,
         pnp_min_area_ratio=args.pnp_min_area_ratio,
+        apply_z_search=(not args.disable_pnp_z_search),
+        z_search_min_m=args.pnp_z_search_min_m,
+        z_search_max_m=args.pnp_z_search_max_m,
+        z_search_step_m=args.pnp_z_search_step_m,
+        return_raw_adds=True,
     )
 
     # Print results
@@ -1170,6 +1478,36 @@ def run_inference(args):
     if args.output_dir:
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Optional: save AUC/PCK plots.
+        if args.save_metric_plots:
+            kp_l2_errors, kp_denom = collect_keypoint_l2_errors(
+                all_kp_projs_detected.reshape(n_samples * len(keypoint_names), 2),
+                all_kp_projs_gt.reshape(n_samples * len(keypoint_names), 2),
+                raw_resolution,
+            )
+            direct_add_values = collect_direct_add_values(
+                all_pred_3d,
+                all_kp_pos_gt,
+                all_kp_projs_gt,
+                raw_resolution,
+            )
+            metric_plot_paths = save_metric_plots(
+                output_dir=output_dir,
+                kp_errors=kp_l2_errors,
+                kp_denom=kp_denom,
+                kp_auc_threshold=args.kp_auc_threshold,
+                pnp_adds_dream=pnp_adds,
+                pnp_adds_robopepp=robopepp_pnp_adds,
+                num_pnp_possible=int(pnp_metrics.get('num_pnp_possible', 0)),
+                direct_adds=direct_add_values,
+                add_auc_threshold=args.add_auc_threshold,
+                pred_3d_source=args.pred_3d_source,
+            )
+            if metric_plot_paths:
+                print("Saved metric plots:")
+                for p in metric_plot_paths:
+                    print(f"  - {p}")
 
         results = {
             'dataset': str(args.dataset_dir),
@@ -1339,6 +1677,8 @@ def main():
     # Output
     parser.add_argument('--output-dir', type=str, default=None,
                         help='Output directory for results')
+    parser.add_argument('--save-metric-plots', action='store_true', default=False,
+                        help='Save PCK/AUC and ADD/AUC plots into output directory')
     parser.add_argument('--save-per-frame-errors', action='store_true', default=False,
                         help='Save per-frame 3D error report and top-k outliers')
     parser.add_argument('--outlier-topk', type=int, default=100,
@@ -1357,6 +1697,14 @@ def main():
                         help='Mask predicted 2D keypoints when heatmap peak logit is below this threshold')
     parser.add_argument('--fill-invalid-2d-with-fk-reproj', action='store_true',
                         help='After successful PnP, fill invalid/low-reliability 2D keypoints using FK reprojection')
+    parser.add_argument('--disable-pnp-z-search', action='store_true',
+                        help='Disable test-time Z-translation grid search after PnP')
+    parser.add_argument('--pnp-z-search-min-m', type=float, default=-0.05,
+                        help='Minimum Z offset (m) for post-PnP translation search')
+    parser.add_argument('--pnp-z-search-max-m', type=float, default=0.05,
+                        help='Maximum Z offset (m) for post-PnP translation search')
+    parser.add_argument('--pnp-z-search-step-m', type=float, default=0.001,
+                        help='Step size (m) for post-PnP Z translation search')
 
     args = parser.parse_args()
 

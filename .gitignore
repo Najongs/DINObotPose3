@@ -14,7 +14,8 @@ DREAM/
 robopose/
 eval_outputs*/
 panda-description/
-
+wandb/
+outputs_heatmap/
 # Distribution / packaging
 .Python
 build/
