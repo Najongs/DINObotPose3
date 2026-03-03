@@ -1,0 +1,84 @@
+{
+  "panda_link0_2d_px": 0.3312125504016876,
+  "panda_link2_2d_px": 1.4723467826843262,
+  "panda_link3_2d_px": 2.6360299587249756,
+  "panda_link4_2d_px": 3.8096559047698975,
+  "panda_link6_2d_px": 21.403213500976562,
+  "panda_link7_2d_px": 25.2385196685791,
+  "panda_hand_2d_px": 25.40089988708496,
+  "mean_2d_px": 11.470268249511719,
+  "max_2d_px": 25.40089988708496,
+  "median_2d_px": 3.8096559047698975,
+  "panda_link0_3d_m": 0.047683767067342654,
+  "panda_link2_3d_m": 0.07441883396705501,
+  "panda_link3_3d_m": 0.10423051586145109,
+  "panda_link4_3d_m": 0.10737818702347036,
+  "panda_link6_3d_m": 0.10619541473450449,
+  "panda_link7_3d_m": 0.11163864798014766,
+  "panda_hand_3d_m": 0.11132089203865361,
+  "mean_3d_m": 0.09469517981037498,
+  "max_3d_m": 0.11163864798014766,
+  "median_3d_m": 0.10619541473450449,
+  "mean_2d_norm": 1.4337835311889648,
+  "json_path": "/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-orb/031945.json",
+  "image_path": "/data/public/NAS/DINObotPose2/Dataset/DREAM_real/panda-orb/panda-orb/031945.rgb.jpg",
+  "ignored_keypoints": {
+    "low_peak_logit": [
+      "panda_link6",
+      "panda_link7",
+      "panda_hand"
+    ],
+    "low_conf": [],
+    "reproj_outlier": [],
+    "pnp_select": []
+  },
+  "pnp": {
+    "mode": "epnp",
+    "reproj_outlier_thresh_px": 12.0,
+    "min_span_px": 5.0,
+    "min_area_ratio": 0.001,
+    "used_keypoints": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "removed_reproj_keypoints": [],
+    "spread_ok": true,
+    "spread_span_xy_px": [
+      31.25,
+      253.125
+    ],
+    "spread_area_ratio": 0.023925709812108464
+  },
+  "heatmap_peak": {
+    "panda_link0": {
+      "peak_logit": 0.7195149064064026,
+      "peak_sigmoid": 0.6725001931190491
+    },
+    "panda_link2": {
+      "peak_logit": 0.7889575362205505,
+      "peak_sigmoid": 0.68760746717453
+    },
+    "panda_link3": {
+      "peak_logit": 0.7332313060760498,
+      "peak_sigmoid": 0.6755139827728271
+    },
+    "panda_link4": {
+      "peak_logit": 0.8038015961647034,
+      "peak_sigmoid": 0.6907870769500732
+    },
+    "panda_link6": {
+      "peak_logit": 0.2405666708946228,
+      "peak_sigmoid": 0.5598533153533936
+    },
+    "panda_link7": {
+      "peak_logit": 0.06579406559467316,
+      "peak_sigmoid": 0.516442596912384
+    },
+    "panda_hand": {
+      "peak_logit": 0.09757842868566513,
+      "peak_sigmoid": 0.5243752598762512
+    }
+  }
+}

@@ -25,7 +25,7 @@ import dream
 
 # Import model from Train directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../TRAIN')))
-from model import DINOv3PoseEstimator
+from model import DINOv3PoseEstimator, panda_forward_kinematics
 from checkpoint_compat import load_checkpoint_compat
 
 
@@ -69,6 +69,22 @@ def _compute_robopepp_fk_keypoints(joint_angles, device, urdf_file, fix_joint7_z
     return keypoints_3d[:, [0, 2, 3, 4, 6, 7, 8], :]
 
 
+def _compute_internal_fk_keypoints(joint_angles, fix_joint7_zero=False):
+    """Fallback FK using internal TRAIN/model.py implementation (no RoboPEPP dependency)."""
+    if joint_angles.shape[1] >= 7:
+        joint_angles_fk = joint_angles[:, :7].clone()
+    else:
+        pad = torch.zeros(
+            (joint_angles.shape[0], 7 - joint_angles.shape[1]),
+            device=joint_angles.device,
+            dtype=joint_angles.dtype,
+        )
+        joint_angles_fk = torch.cat([joint_angles, pad], dim=1)
+    if fix_joint7_zero and joint_angles_fk.shape[1] >= 7:
+        joint_angles_fk[:, 6] = 0.0
+    return panda_forward_kinematics(joint_angles_fk)
+
+
 def get_keypoints_from_heatmaps(heatmaps_tensor, min_confidence=0.0, min_peak_logit=None):
     """Extract keypoint coordinates from heatmaps and optionally mask low confidence."""
     B, N, H, W = heatmaps_tensor.shape
@@ -109,6 +125,10 @@ def transform_robot_to_camera(
     reproj_refit=True,
     min_span_px=20.0,
     min_area_ratio=0.001,
+    z_search_enabled=False,
+    z_search_min_m=-0.05,
+    z_search_max_m=0.05,
+    z_search_step_m=0.001,
 ):
     """
     Transform robot frame keypoints to camera frame using PnP.
@@ -135,6 +155,9 @@ def transform_robot_to_camera(
         "spread_span_xy_px": [0.0, 0.0],
         "spread_area_ratio": 0.0,
         "proj_2d_all": None,
+        "z_search_applied": False,
+        "z_search_best_offset_m": 0.0,
+        "z_search_best_error_px": None,
     }
     try:
         # PnP requires at least 4 points
@@ -258,6 +281,49 @@ def transform_robot_to_camera(
             print("Warning: PnP failed to find solution")
             return None, info
 
+        def optimize_translation_z(obj_pts_all, img_pts_all, rvec_in, tvec_in):
+            valid_local = (
+                np.isfinite(obj_pts_all).all(axis=1)
+                & np.isfinite(img_pts_all).all(axis=1)
+                & (img_pts_all[:, 0] > -900.0)
+                & (img_pts_all[:, 1] > -900.0)
+            )
+            idx_local = np.where(valid_local)[0]
+            if idx_local.shape[0] < min_points:
+                return tvec_in, None, 0.0
+
+            obj_valid = obj_pts_all[idx_local].astype(np.float64)
+            img_valid = img_pts_all[idx_local].astype(np.float64)
+            t_base = np.array(tvec_in, dtype=np.float64).reshape(3)
+            r_use = np.array(rvec_in, dtype=np.float64).reshape(3, 1)
+
+            step = float(z_search_step_m)
+            if step <= 0.0:
+                return t_base.reshape(3, 1), None, 0.0
+
+            z_min = float(z_search_min_m)
+            z_max = float(z_search_max_m)
+            if z_max < z_min:
+                z_min, z_max = z_max, z_min
+
+            candidates = np.arange(z_min, z_max + 0.5 * step, step, dtype=np.float64)
+            best_t = t_base.copy()
+            best_err = None
+            best_off = 0.0
+
+            for dz in candidates:
+                t_try = t_base.copy()
+                t_try[2] += float(dz)
+                proj_try, _ = cv2.projectPoints(obj_valid, r_use, t_try.reshape(3, 1), camera_K, None)
+                proj_try = proj_try.reshape(-1, 2)
+                err = float(np.mean(np.linalg.norm(proj_try - img_valid, axis=1)))
+                if (best_err is None) or (err < best_err):
+                    best_err = err
+                    best_t = t_try
+                    best_off = float(dz)
+
+            return best_t.reshape(3, 1), best_err, best_off
+
         # Reprojection outlier rejection + refit:
         # drop points with large reprojection residual, then solve again.
         idx_final = idx_sel.copy()
@@ -279,6 +345,15 @@ def transform_robot_to_camera(
         else:
             info["reproj_errors_px"] = np.array([], dtype=np.float64)
 
+        if z_search_enabled:
+            tvec_opt, best_err_px, best_off = optimize_translation_z(
+                robot_kpts, pred_2d, rvec, tvec
+            )
+            tvec = tvec_opt
+            info["z_search_applied"] = True
+            info["z_search_best_offset_m"] = float(best_off)
+            info["z_search_best_error_px"] = (None if best_err_px is None else float(best_err_px))
+
         # Convert rotation vector to rotation matrix
         R, _ = cv2.Rodrigues(rvec)
         t = tvec.flatten()
@@ -295,6 +370,12 @@ def transform_robot_to_camera(
             print(
                 f"# PnP reprojection outlier rejection: removed {info['idx_removed_reproj'].shape[0]} points "
                 f"(thresh={reproj_outlier_thresh_px:.1f}px), final used={len(idx_final)}"
+            )
+        if info["z_search_applied"]:
+            err_str = "n/a" if info["z_search_best_error_px"] is None else f"{info['z_search_best_error_px']:.3f}px"
+            print(
+                f"# Z-search: offset={info['z_search_best_offset_m']:+.3f}m, reproj_mean={err_str}, "
+                f"range=[{float(z_search_min_m):+.3f},{float(z_search_max_m):+.3f}]m, step={float(z_search_step_m):.3f}m"
             )
 
         return camera_kpts, info
@@ -551,13 +632,21 @@ def network_inference(args):
                 pred_kpts_3d = outputs["keypoints_3d_fk"] if "keypoints_3d_fk" in outputs else outputs["keypoints_3d"]
             else:
                 urdf_file = _resolve_robopepp_urdf(urdf_file)
-                print(f"# FK source: RoboPEPP URDF FK ({urdf_file})")
                 if args.robopepp_fix_joint7_zero:
                     print("# FK option: forcing joint7=0 to match RoboPEPP 6-DoF eval convention")
-                pred_kpts_3d = _compute_robopepp_fk_keypoints(
-                    outputs["joint_angles"], device, urdf_file,
-                    fix_joint7_zero=args.robopepp_fix_joint7_zero
-                )
+                try:
+                    print(f"# FK source: RoboPEPP URDF FK ({urdf_file})")
+                    pred_kpts_3d = _compute_robopepp_fk_keypoints(
+                        outputs["joint_angles"], device, urdf_file,
+                        fix_joint7_zero=args.robopepp_fix_joint7_zero
+                    )
+                except Exception as e:
+                    print(f"# Warning: RoboPEPP FK unavailable ({e})")
+                    print("# Fallback: internal Panda FK from TRAIN/model.py")
+                    pred_kpts_3d = _compute_internal_fk_keypoints(
+                        outputs["joint_angles"],
+                        fix_joint7_zero=args.robopepp_fix_joint7_zero,
+                    )
         else:
             pred_kpts_3d = outputs["keypoints_3d"]
 
@@ -603,6 +692,10 @@ def network_inference(args):
             reproj_refit=(not args.disable_pnp_reproj_refit),
             min_span_px=args.pnp_min_span_px,
             min_area_ratio=args.pnp_min_area_ratio,
+            z_search_enabled=(not args.disable_pnp_z_search),
+            z_search_min_m=args.pnp_z_search_min_m,
+            z_search_max_m=args.pnp_z_search_max_m,
+            z_search_step_m=args.pnp_z_search_step_m,
         )
         if pred_3d is None:
             print("# Warning: PnP failed, using robot frame coordinates (comparison with GT will be invalid)")
@@ -977,6 +1070,14 @@ if __name__ == "__main__":
                         help="Mask predicted 2D keypoints when sigmoid(max_heatmap_logit) is below this threshold")
     parser.add_argument("--fill-invalid-2d-with-fk-reproj", action="store_true",
                         help="After successful PnP, fill invalid/low-reliability 2D keypoints using FK reprojection")
+    parser.add_argument("--disable-pnp-z-search", action="store_true",
+                        help="Disable test-time Z-translation grid search after PnP")
+    parser.add_argument("--pnp-z-search-min-m", type=float, default=-0.05,
+                        help="Minimum Z offset (m) for post-PnP translation search")
+    parser.add_argument("--pnp-z-search-max-m", type=float, default=0.05,
+                        help="Maximum Z offset (m) for post-PnP translation search")
+    parser.add_argument("--pnp-z-search-step-m", type=float, default=0.001,
+                        help="Step size (m) for post-PnP Z translation search")
     args = parser.parse_args()
 
     network_inference(args)

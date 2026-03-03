@@ -8,8 +8,8 @@
 # =============================================================================
 
 # Data paths (REQUIRED - Update these paths!)
-DATA_DIRS=("/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM" "/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn")
-VAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/TOTAL/DREAM_to_DREAM/panda-3cam_azure"  
+DATA_DIRS=("/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM" "/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn")
+VAL_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/TOTAL/DREAM_to_DREAM/panda-3cam_azure"  
 
 # DATA_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
 # VAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"  # Validation data directory (separate from training)
@@ -49,10 +49,10 @@ REFINEMENT_WEIGHT=50.0         # Refinement loss weight
 # Loss weights
 HEATMAP_WEIGHT=1000.0
 KP3D_WEIGHT=100.0
-HEATMAP_ONLY_TRAIN=True  # True: train only 2D heatmap branch
+HEATMAP_ONLY_TRAIN=False  # True: train only 2D heatmap branch
 
 # FDA (Fourier Domain Adaptation) for sim-to-real
-FDA_REAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_real"  # Real images (no labels needed)
+FDA_REAL_DIR="/data/public/NAS/DINObotPose2/Dataset/DREAM_real"  # Real images (no labels needed)
 # FDA_REAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_real"
 FDA_BETA=0.001   # Low-freq replacement ratio (0.01=subtle tone shift, 0.05=strong)
 FDA_PROB=0.5   # Probability of applying FDA per sample (0.0 to disable)
@@ -61,7 +61,7 @@ OCCLUSION_MAX_HOLES=3       # Maximum occlusion patches per image
 OCCLUSION_MAX_SIZE_FRAC=0.2 # Max patch size ratio (image side fraction)
 
 # Training hyperparameters
-EPOCHS=50
+EPOCHS=100
 BATCH_SIZE=16
 NUM_WORKERS=4
 OPTIMIZER="adam"  # Options: adam, adamw, sgd
@@ -88,10 +88,10 @@ WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 
 # Other settings
 SEED=42
-RESUME="/home/najo/NAS/DIP/DINObotPose2/Train/outputs/dinov3_base_20260302_180056/epoch_1.pth"  # Path to checkpoint for resuming (leave empty for new training)
+RESUME="/data/public/NAS/DINObotPose3/TRAIN/outputs/dinov3_base_20260303_020716/epoch_56.pth"  # Path to checkpoint for resuming (leave empty for new training)
 RESUME_LR=""  # Learning rate to use when resuming (leave empty for automatic calculation from scheduler)
 LOAD_2D_HEAD=""  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
-FREEZE_2D_HEAD_EPOCHS=50  # If LOAD_2D_HEAD is set, freeze loaded 2D head for first N epochs then unfreeze
+FREEZE_2D_HEAD_EPOCHS=100  # If LOAD_2D_HEAD is set, freeze loaded 2D head for first N epochs then unfreeze
 
 # =============================================================================
 # Training Modes
@@ -104,8 +104,8 @@ FREEZE_2D_HEAD_EPOCHS=50  # If LOAD_2D_HEAD is set, freeze loaded 2D head for fi
 
 # --- Multi-GPU Training (Distributed Data Parallel) ---
 TRAIN_MODE="multi_gpu"
-NUM_GPUS=5  # 사용할 GPU 개수 (single GPU는 1로 설정)
-GPU_IDS="0,1,2,3,4"  # 사용할 GPU ID (예: "0,1,2,3")
+NUM_GPUS=3  # 사용할 GPU 개수 (single GPU는 1로 설정)
+GPU_IDS="0,1,2"  # 사용할 GPU ID (예: "0,1,2,3")
 
 # =============================================================================
 # Execute Training

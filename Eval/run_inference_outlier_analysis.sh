@@ -4,8 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Model and dataset
-MODEL_PATH="/data/public/NAS/DINObotPose2/Train/outputs/*dinov3_base_20260302_190422/*best_model_total_3d.pth"
+MODEL_PATH="/data/public/NAS/DINObotPose3/TRAIN/outputs/ssl_unified_20260303_165018/best_ssl.pth"
 DATASET_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"
+# DATASET_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_kinect360"
+# DATASET_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_realsense"
+# DATASET_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-orb"
+# DATASET_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_test_dr"
+# DATASET_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_test_photo"
 
 # Output
 OUTPUT_DIR="${SCRIPT_DIR}/eval_outputs_outlier"
@@ -14,11 +19,14 @@ OUTPUT_DIR="${SCRIPT_DIR}/eval_outputs_outlier"
 BATCH_SIZE=64
 NUM_WORKERS=4
 FIX_JOINT7_ZERO=1
-KP_MIN_CONFIDENCE=0.5  # mask low-confidence 2D keypoints as invalid (-999)
+KP_MIN_CONFIDENCE=0.25  # mask low-confidence 2D keypoints as invalid (-999)
 KP_MIN_PEAK_LOGIT=0.25  # mask low-peak heatmap keypoints as invalid (-999)
-PNP_MIN_SPAN_PX=20.0
+PNP_MIN_SPAN_PX=10.0
 PNP_MIN_AREA_RATIO=0.001
 FILL_INVALID_2D_WITH_FK_REPROJ=0  # keep 0 for strict benchmark comparability
+PNP_Z_SEARCH_MIN_M=-0.05
+PNP_Z_SEARCH_MAX_M=0.05
+PNP_Z_SEARCH_STEP_M=0.001
 
 # Metrics thresholds
 KP_AUC_THRESHOLD=20.0
@@ -47,6 +55,9 @@ if [ "${INFER_MODE}" = "single_gpu" ]; then
         --kp-min-peak-logit "${KP_MIN_PEAK_LOGIT}" \
         --pnp-min-span-px "${PNP_MIN_SPAN_PX}" \
         --pnp-min-area-ratio "${PNP_MIN_AREA_RATIO}" \
+        --pnp-z-search-min-m "${PNP_Z_SEARCH_MIN_M}" \
+        --pnp-z-search-max-m "${PNP_Z_SEARCH_MAX_M}" \
+        --pnp-z-search-step-m "${PNP_Z_SEARCH_STEP_M}" \
         $( [[ "${FILL_INVALID_2D_WITH_FK_REPROJ}" == "1" ]] && echo "--fill-invalid-2d-with-fk-reproj" ) \
         --robopepp-pnp-init-thresh 0.25 \
         --robopepp-pnp-conf-step 0.025 \
@@ -75,6 +86,9 @@ elif [ "${INFER_MODE}" = "multi_gpu" ]; then
         --kp-min-peak-logit "${KP_MIN_PEAK_LOGIT}" \
         --pnp-min-span-px "${PNP_MIN_SPAN_PX}" \
         --pnp-min-area-ratio "${PNP_MIN_AREA_RATIO}" \
+        --pnp-z-search-min-m "${PNP_Z_SEARCH_MIN_M}" \
+        --pnp-z-search-max-m "${PNP_Z_SEARCH_MAX_M}" \
+        --pnp-z-search-step-m "${PNP_Z_SEARCH_STEP_M}" \
         $( [[ "${FILL_INVALID_2D_WITH_FK_REPROJ}" == "1" ]] && echo "--fill-invalid-2d-with-fk-reproj" ) \
         --robopepp-pnp-init-thresh 0.25 \
         --robopepp-pnp-conf-step 0.025 \

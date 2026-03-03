@@ -11,7 +11,7 @@ import os
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -27,10 +27,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Import DREAM utilities
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../DREAM')))
-import dream
-from dream import analysis as dream_analysis
+# Optional DREAM utilities (fallback to OpenCV-only path when unavailable)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../DREAM")))
+try:
+    import dream  # type: ignore
+    DREAM_AVAILABLE = True
+except Exception:
+    dream = None
+    DREAM_AVAILABLE = False
 
 # Import model from TRAIN directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../TRAIN')))
@@ -233,7 +237,71 @@ def passes_pnp_spread_check(points_2d: np.ndarray, image_resolution: Tuple[int, 
     )
 
 
-def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
+def _optimize_translation_z_for_reprojection(
+    robot_kpts: np.ndarray,
+    pred_2d: np.ndarray,
+    camera_K: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    z_min_m: float = -0.05,
+    z_max_m: float = 0.05,
+    z_step_m: float = 0.001,
+    min_points: int = 4,
+) -> Tuple[np.ndarray, Optional[float], float]:
+    """Post-PnP Z-only search that minimizes 2D reprojection error."""
+    valid = (
+        np.isfinite(robot_kpts).all(axis=1)
+        & np.isfinite(pred_2d).all(axis=1)
+        & (pred_2d[:, 0] > -900.0)
+        & (pred_2d[:, 1] > -900.0)
+    )
+    idx = np.where(valid)[0]
+    if idx.shape[0] < int(min_points):
+        return np.array(tvec, dtype=np.float64).reshape(3, 1), None, 0.0
+
+    obj_valid = robot_kpts[idx].astype(np.float64)
+    img_valid = pred_2d[idx].astype(np.float64)
+    K = camera_K.astype(np.float64)
+    rv = np.array(rvec, dtype=np.float64).reshape(3, 1)
+    t_base = np.array(tvec, dtype=np.float64).reshape(3)
+
+    step = float(z_step_m)
+    if step <= 0.0:
+        return t_base.reshape(3, 1), None, 0.0
+
+    z_lo = float(z_min_m)
+    z_hi = float(z_max_m)
+    if z_hi < z_lo:
+        z_lo, z_hi = z_hi, z_lo
+
+    candidates = np.arange(z_lo, z_hi + 0.5 * step, step, dtype=np.float64)
+    best_t = t_base.copy()
+    best_err = None
+    best_offset = 0.0
+
+    for dz in candidates:
+        t_try = t_base.copy()
+        t_try[2] += float(dz)
+        proj, _ = cv2.projectPoints(obj_valid, rv, t_try.reshape(3, 1), K, None)
+        proj = proj.reshape(-1, 2)
+        err = float(np.mean(np.linalg.norm(proj - img_valid, axis=1)))
+        if (best_err is None) or (err < best_err):
+            best_err = err
+            best_t = t_try
+            best_offset = float(dz)
+
+    return best_t.reshape(3, 1), best_err, best_offset
+
+
+def transform_robot_to_camera(
+    robot_kpts,
+    pred_2d,
+    camera_K,
+    apply_z_search: bool = False,
+    z_search_min_m: float = -0.05,
+    z_search_max_m: float = 0.05,
+    z_search_step_m: float = 0.001,
+):
     """
     Transform robot frame keypoints to camera frame using EPnP.
 
@@ -275,6 +343,19 @@ def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
         if not success:
             return None, None
 
+        if apply_z_search:
+            tvec, _, _ = _optimize_translation_z_for_reprojection(
+                robot_kpts=robot_kpts,
+                pred_2d=pred_2d,
+                camera_K=camera_K,
+                rvec=rvec,
+                tvec=tvec,
+                z_min_m=z_search_min_m,
+                z_max_m=z_search_max_m,
+                z_step_m=z_search_step_m,
+                min_points=4,
+            )
+
         # Convert rotation vector to rotation matrix
         R, _ = cv2.Rodrigues(rvec)
         t = tvec.flatten()
@@ -287,6 +368,55 @@ def transform_robot_to_camera(robot_kpts, pred_2d, camera_K):
 
     except Exception as e:
         return None, None
+
+
+def solve_pnp_epnp_iterative(
+    points_3d: np.ndarray,
+    points_2d: np.ndarray,
+    camera_K: np.ndarray,
+) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray]]:
+    """OpenCV PnP fallback equivalent to DREAM-style EPnP(+iterative refine)."""
+    try:
+        ok, rvec, tvec = cv2.solvePnP(
+            points_3d.astype(np.float64),
+            points_2d.astype(np.float64),
+            camera_K.astype(np.float64),
+            None,
+            flags=cv2.SOLVEPNP_EPNP,
+        )
+        if not ok:
+            return False, None, None
+        ok, rvec, tvec = cv2.solvePnP(
+            points_3d.astype(np.float64),
+            points_2d.astype(np.float64),
+            camera_K.astype(np.float64),
+            None,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+            useExtrinsicGuess=True,
+            rvec=rvec,
+            tvec=tvec,
+        )
+        if not ok:
+            return False, None, None
+        return True, rvec, tvec
+    except Exception:
+        return False, None, None
+
+
+def add_from_pose_rvec_tvec(
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    points_3d: np.ndarray,
+) -> float:
+    """
+    ADD proxy without DREAM:
+    transform 3D points by solved pose and compare to original points.
+    """
+    R, _ = cv2.Rodrigues(np.array(rvec, dtype=np.float64).reshape(3, 1))
+    t = np.array(tvec, dtype=np.float64).reshape(3)
+    pts = np.array(points_3d, dtype=np.float64).reshape(-1, 3)
+    pts_tf = (R @ pts.T).T + t.reshape(1, 3)
+    return float(np.linalg.norm(pts_tf - pts, axis=1).mean())
 
 
 def compute_keypoint_metrics(
@@ -544,6 +674,10 @@ def compute_robopepp_style_pnp_add_metrics(
     conf_step: float = 0.025,
     pnp_min_span_px: float = 20.0,
     pnp_min_area_ratio: float = 0.001,
+    apply_z_search: bool = False,
+    z_search_min_m: float = -0.05,
+    z_search_max_m: float = 0.05,
+    z_search_step_m: float = 0.001,
     return_raw_adds: bool = False,
 ) -> Dict:
     """
@@ -590,6 +724,19 @@ def compute_robopepp_style_pnp_add_metrics(
             if not success:
                 pnp_adds.append(pnp_magic_number)
                 continue
+
+            if apply_z_search:
+                tvec, _, _ = _optimize_translation_z_for_reprojection(
+                    robot_kpts=pred_3d_robot,
+                    pred_2d=pred_2d,
+                    camera_K=sample_K,
+                    rvec=rvec,
+                    tvec=tvec,
+                    z_min_m=z_search_min_m,
+                    z_max_m=z_search_max_m,
+                    z_step_m=z_search_step_m,
+                    min_points=min_points,
+                )
 
             R, _ = cv2.Rodrigues(rvec)
             t = tvec.flatten()
@@ -824,6 +971,8 @@ def run_inference(args):
     """Run inference on dataset and compute metrics"""
     is_distributed, rank, world_size, local_rank = setup_distributed(args.distributed)
     is_main_process = (not is_distributed) or (rank == 0)
+    if is_main_process and not DREAM_AVAILABLE:
+        print("Info: DREAM package not found. Using OpenCV fallback for PnP/ADD baseline.")
 
     dataset_dir = Path(args.dataset_dir)
     camera_K, raw_resolution = load_camera_from_first_frame(dataset_dir)
@@ -1021,7 +1170,15 @@ def run_inference(args):
                 ):
                     pred_3d_camera, proj_2d_all = None, None
                 else:
-                    pred_3d_camera, proj_2d_all = transform_robot_to_camera(pred_3d_robot_sample, pred_kp_scaled, sample_camera_K)
+                    pred_3d_camera, proj_2d_all = transform_robot_to_camera(
+                        pred_3d_robot_sample,
+                        pred_kp_scaled,
+                        sample_camera_K,
+                        apply_z_search=(not args.disable_pnp_z_search),
+                        z_search_min_m=args.pnp_z_search_min_m,
+                        z_search_max_m=args.pnp_z_search_max_m,
+                        z_search_step_m=args.pnp_z_search_step_m,
+                    )
                 if pred_3d_camera is not None:
                     pred_3d_sample = pred_3d_camera
                     if args.fill_invalid_2d_with_fk_reproj and proj_2d_all is not None:
@@ -1164,21 +1321,33 @@ def run_inference(args):
                 pnp_adds.append(-999.0)
                 continue
 
-            # Solve PnP using DREAM wrapper (EPnP + optional refinement).
+            # Solve PnP using DREAM wrapper if available; otherwise OpenCV fallback.
             try:
-                success, translation, quaternion = dream.geometric_vision.solve_pnp(
-                    kp_3d_pnp.astype(np.float64),
-                    kp_det_pnp.astype(np.float64),
-                    sample_K.astype(np.float64),
-                )
-
-                if success:
-                    add = dream.geometric_vision.add_from_pose(
-                        translation, quaternion, kp_3d_pnp, sample_K
+                if DREAM_AVAILABLE:
+                    success, translation, quaternion = dream.geometric_vision.solve_pnp(
+                        kp_3d_pnp.astype(np.float64),
+                        kp_det_pnp.astype(np.float64),
+                        sample_K.astype(np.float64),
                     )
-                    pnp_adds.append(add)
+
+                    if success:
+                        add = dream.geometric_vision.add_from_pose(
+                            translation, quaternion, kp_3d_pnp, sample_K
+                        )
+                        pnp_adds.append(add)
+                    else:
+                        pnp_adds.append(-999.0)
                 else:
-                    pnp_adds.append(-999.0)
+                    success, rvec, tvec = solve_pnp_epnp_iterative(
+                        kp_3d_pnp,
+                        kp_det_pnp,
+                        sample_K,
+                    )
+                    if success and rvec is not None and tvec is not None:
+                        add = add_from_pose_rvec_tvec(rvec, tvec, kp_3d_pnp)
+                        pnp_adds.append(add)
+                    else:
+                        pnp_adds.append(-999.0)
             except Exception:
                 pnp_adds.append(-999.0)
         else:
@@ -1206,6 +1375,10 @@ def run_inference(args):
         conf_step=args.robopepp_pnp_conf_step,
         pnp_min_span_px=args.pnp_min_span_px,
         pnp_min_area_ratio=args.pnp_min_area_ratio,
+        apply_z_search=(not args.disable_pnp_z_search),
+        z_search_min_m=args.pnp_z_search_min_m,
+        z_search_max_m=args.pnp_z_search_max_m,
+        z_search_step_m=args.pnp_z_search_step_m,
         return_raw_adds=True,
     )
 
@@ -1524,6 +1697,14 @@ def main():
                         help='Mask predicted 2D keypoints when heatmap peak logit is below this threshold')
     parser.add_argument('--fill-invalid-2d-with-fk-reproj', action='store_true',
                         help='After successful PnP, fill invalid/low-reliability 2D keypoints using FK reprojection')
+    parser.add_argument('--disable-pnp-z-search', action='store_true',
+                        help='Disable test-time Z-translation grid search after PnP')
+    parser.add_argument('--pnp-z-search-min-m', type=float, default=-0.05,
+                        help='Minimum Z offset (m) for post-PnP translation search')
+    parser.add_argument('--pnp-z-search-max-m', type=float, default=0.05,
+                        help='Maximum Z offset (m) for post-PnP translation search')
+    parser.add_argument('--pnp-z-search-step-m', type=float, default=0.001,
+                        help='Step size (m) for post-PnP Z translation search')
 
     args = parser.parse_args()
 

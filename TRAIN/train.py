@@ -329,16 +329,10 @@ class UnifiedPoseLoss(nn.Module):
         fk_3d_weight: float = 0.0,  # FK 3D keypoint MSE loss weight (robot frame)
         camera_3d_weight: float = 0.0,  # Camera-frame 3D loss weight (with PnP transform)
         loss_type: str = 'smoothl1',  # Loss function type: 'mse', 'l1', 'smoothl1'
-        use_adaptive_weighting: bool = True,  # Use uncertainty-based adaptive weighting
         pnp_failure_penalty_weight: float = 0.1,  # PnP failure penalty weight
-        refinement_weight: float = 0.0,  # Iterative refinement loss weight
         direct_3d_weight: float = 5.0,  # Direct 3D branch supervision weight (robot frame)
         consistency_weight: float = 1.0,  # FK branch vs direct branch consistency weight
         fusion_delta_weight: float = 0.1,  # Residual correction regularization weight
-        use_hard_sample_3d_reweight: bool = False,  # Train-time hard sample upweighting for 3D losses
-        hard_sample_3d_power: float = 1.0,  # weight = (err / mean_err) ** power
-        hard_sample_3d_max_weight: float = 3.0,  # clamp upper bound for stability
-        keypoint_3d_weights: Optional[List[float]] = None,  # Optional per-keypoint weights for 3D losses
     ):
         super().__init__()
         self.heatmap_weight = heatmap_weight
@@ -348,20 +342,10 @@ class UnifiedPoseLoss(nn.Module):
         self.fk_3d_weight = fk_3d_weight
         self.camera_3d_weight = camera_3d_weight
         self.loss_type = loss_type
-        self.use_adaptive_weighting = use_adaptive_weighting
         self.pnp_failure_penalty_weight = pnp_failure_penalty_weight
-        self.refinement_weight = refinement_weight
         self.direct_3d_weight = direct_3d_weight
         self.consistency_weight = consistency_weight
         self.fusion_delta_weight = fusion_delta_weight
-        self.use_hard_sample_3d_reweight = use_hard_sample_3d_reweight
-        self.hard_sample_3d_power = hard_sample_3d_power
-        self.hard_sample_3d_max_weight = hard_sample_3d_max_weight
-        if keypoint_3d_weights is not None:
-            kp_w = torch.tensor(keypoint_3d_weights, dtype=torch.float32)
-            self.register_buffer('keypoint_3d_weights', kp_w)
-        else:
-            self.register_buffer('keypoint_3d_weights', None)
 
         # Heatmap loss: 항상 MSE 사용 (값 범위 0~1, Gaussian GT와 MSE가 자연스러움)
         self.heatmap_loss_fn = nn.MSELoss(reduction='none')
@@ -378,48 +362,38 @@ class UnifiedPoseLoss(nn.Module):
         else:
             raise ValueError(f"Unknown loss type: {loss_type}")
 
-        # Adaptive loss weighting parameters (learnable uncertainty)
-        if use_adaptive_weighting:
-            self.log_sigma_heatmap = nn.Parameter(torch.zeros(1))
-            self.log_sigma_3d = nn.Parameter(torch.zeros(1))
-
         self.eps = 1e-6  # Numerical stability
 
-    def _reduce_with_optional_weights(self, diff, valid_mask=None, sample_weights=None, keypoint_weights=None):
+    def _reduce_with_optional_weights(self, diff, valid_mask=None, sample_weights=None):
         """Reduce element-wise loss to scalar with optional valid mask and sample weights."""
         B = diff.shape[0]
-        kp_weights = None
-        if keypoint_weights is not None and diff.dim() >= 2 and diff.shape[1] == keypoint_weights.numel():
-            kp_weights = keypoint_weights.to(diff.device)
 
         if valid_mask is not None and diff.dim() >= 2 and valid_mask.shape[0] == B:
             joint_weight = valid_mask.float()
-            if kp_weights is not None:
-                joint_weight = joint_weight * kp_weights.unsqueeze(0)
-
             mask = joint_weight
             while mask.dim() < diff.dim():
                 mask = mask.unsqueeze(-1)
             diff = diff * mask
             per_sample = diff.view(B, -1).sum(dim=1) / (joint_weight.sum(dim=1) + self.eps)
         else:
-            if kp_weights is not None and diff.dim() >= 2 and diff.shape[1] == kp_weights.numel():
-                mask = kp_weights.view(1, -1, *([1] * (diff.dim() - 2)))
-                diff = diff * mask
-                per_sample = diff.view(B, -1).sum(dim=1) / (kp_weights.sum() + self.eps)
-            else:
-                per_sample = diff.view(B, -1).mean(dim=1)
+            per_sample = diff.view(B, -1).mean(dim=1)
 
         if sample_weights is not None:
             weighted = per_sample * sample_weights
             return weighted.sum() / (sample_weights.sum() + self.eps), per_sample
         return per_sample.mean(), per_sample
 
-    def _compute_hard_sample_weights(self, sample_error):
-        """Compute detached hard-sample weights from per-sample error."""
-        rel_error = sample_error.detach() / (sample_error.detach().mean() + self.eps)
-        weights = torch.clamp(rel_error.pow(self.hard_sample_3d_power), min=1.0, max=self.hard_sample_3d_max_weight)
-        return weights
+    def _compute_pose2_heatmap_loss(self, pred_heatmaps, gt_heatmaps, valid_mask=None):
+        """Pose2-compatible heatmap loss (masked MSE over valid joints)."""
+        if valid_mask is not None:
+            mask_expanded = valid_mask.unsqueeze(-1).unsqueeze(-1).float()  # (B, J, 1, 1)
+            heatmap_diff = self.heatmap_loss_fn(pred_heatmaps, gt_heatmaps)
+            heatmap_diff_masked = heatmap_diff * mask_expanded
+            spatial_size = heatmap_diff.shape[-2] * heatmap_diff.shape[-1]
+            return heatmap_diff_masked.sum() / (mask_expanded.sum() * spatial_size + self.eps)
+
+        heatmap_diff = self.heatmap_loss_fn(pred_heatmaps, gt_heatmaps)
+        return heatmap_diff.mean()
 
     def forward(self, pred_dict, gt_dict):
         """
@@ -439,33 +413,9 @@ class UnifiedPoseLoss(nn.Module):
         angle_valid_mask = gt_dict.get('angle_valid_mask', None)  # (B,)
         if angle_valid_mask is not None:
             angle_valid_mask = angle_valid_mask.to(dtype=torch.bool, device=pred_dict['heatmaps_2d'].device)
-        sample_weights_3d = None
         gt_kp_robot = None
         if 'angles' in gt_dict:
             gt_kp_robot = panda_forward_kinematics(gt_dict['angles'])
-
-        # Train-time hard sample upweighting for 3D-related losses only
-        if self.use_hard_sample_3d_reweight and self.training:
-            anchor_error = None
-            if 'joint_angles' in pred_dict and 'angles' in gt_dict:
-                pred_angles_anchor = pred_dict['joint_angles']
-                gt_angles_anchor = gt_dict['angles']
-                n_angle = min(pred_angles_anchor.shape[1], gt_angles_anchor.shape[1])
-                angle_diff = self.loss_fn(pred_angles_anchor[:, :n_angle], gt_angles_anchor[:, :n_angle])
-                anchor_error = angle_diff.mean(dim=1)  # (B,)
-            elif 'keypoints_3d_fk' in pred_dict and gt_kp_robot is not None:
-                fk_diff = self.loss_fn(pred_dict['keypoints_3d_fk'], gt_kp_robot)  # (B, 7, 3)
-                _, anchor_error = self._reduce_with_optional_weights(
-                    fk_diff, valid_mask=valid_mask, keypoint_weights=self.keypoint_3d_weights
-                )
-            elif 'keypoints_3d' in pred_dict and 'keypoints_3d' in gt_dict:
-                kp_diff = self.loss_fn(pred_dict['keypoints_3d'], gt_dict['keypoints_3d'])  # (B, J, 3)
-                _, anchor_error = self._reduce_with_optional_weights(
-                    kp_diff, valid_mask=valid_mask, keypoint_weights=self.keypoint_3d_weights
-                )
-
-            if anchor_error is not None:
-                sample_weights_3d = self._compute_hard_sample_weights(anchor_error)
 
         if angle_valid_mask is not None:
             loss_dict_angle_valid_ratio = angle_valid_mask.float().mean().item()
@@ -474,17 +424,12 @@ class UnifiedPoseLoss(nn.Module):
         else:
             loss_dict_angle_valid_ratio = None
 
-        # 1. 2D Heatmap Loss (항상 MSE: Gaussian GT와 자연스러운 조합)
-        if valid_mask is not None:
-            mask_expanded = valid_mask.unsqueeze(-1).unsqueeze(-1).float()  # (B, MAX_JOINTS, 1, 1)
-            heatmap_diff = self.heatmap_loss_fn(pred_dict['heatmaps_2d'], gt_dict['heatmaps_2d'])
-            heatmap_diff_masked = heatmap_diff * mask_expanded
-            # Normalize by (valid joints * spatial size) to keep masked/unmasked scale consistent.
-            spatial_size = heatmap_diff.shape[-2] * heatmap_diff.shape[-1]
-            loss_heatmap = heatmap_diff_masked.sum() / (mask_expanded.sum() * spatial_size + self.eps)
-        else:
-            heatmap_diff = self.heatmap_loss_fn(pred_dict['heatmaps_2d'], gt_dict['heatmaps_2d'])
-            loss_heatmap = heatmap_diff.mean()
+        # 1. 2D Heatmap Loss (Pose2-compatible path)
+        loss_heatmap = self._compute_pose2_heatmap_loss(
+            pred_dict['heatmaps_2d'],
+            gt_dict['heatmaps_2d'],
+            valid_mask=valid_mask,
+        )
 
         # 2. 3D Keypoint Loss - with masking
         kp3d_pred = pred_dict['keypoints_3d']
@@ -495,55 +440,25 @@ class UnifiedPoseLoss(nn.Module):
             loss_kp3d, _ = self._reduce_with_optional_weights(
                 kp3d_diff,
                 valid_mask=valid_mask,
-                sample_weights=sample_weights_3d if self.kp3d_weight > 0 else None,
-                keypoint_weights=self.keypoint_3d_weights
+                sample_weights=None,
             )
         else:
             kp3d_diff = self.loss_fn(kp3d_pred, kp3d_gt)
             loss_kp3d, _ = self._reduce_with_optional_weights(
                 kp3d_diff,
-                sample_weights=sample_weights_3d if self.kp3d_weight > 0 else None,
-                keypoint_weights=self.keypoint_3d_weights
+                sample_weights=None,
             )
 
-        # Total Loss with Adaptive Weighting or Fixed Weights
-        # kp3d_weight=0이면 (joint_angle 모드 등) kp3d loss를 total에서 완전히 제외
-        use_kp3d = self.kp3d_weight > 0
-
-        if self.use_adaptive_weighting:
-            # Uncertainty-based weighting: loss / (2 * exp(log_sigma)) + log_sigma
-            # joint_angle 모드에서는 kp3d_weight=0이므로 kp3d 항 제외
-            # (robot frame vs camera frame 비교가 되는 잘못된 gradient 방지)
-            if use_kp3d:
-                total_loss = (
-                    loss_heatmap / (2 * torch.exp(self.log_sigma_heatmap)) + self.log_sigma_heatmap +
-                    loss_kp3d / (2 * torch.exp(self.log_sigma_3d)) + self.log_sigma_3d
-                )
-            else:
-                total_loss = (
-                    loss_heatmap / (2 * torch.exp(self.log_sigma_heatmap)) + self.log_sigma_heatmap
-                )
-            loss_dict = {
-                'total': total_loss.item(),
-                'heatmap': loss_heatmap.item(),
-                'kp3d': loss_kp3d.item(),
-                'sigma_hm': torch.exp(self.log_sigma_heatmap).item(),
-                'sigma_3d': torch.exp(self.log_sigma_3d).item(),
-            }
-        else:
-            # Fixed weighting
-            total_loss = (
-                self.heatmap_weight * loss_heatmap +
-                self.kp3d_weight * loss_kp3d  # kp3d_weight=0이면 자동으로 0
-            )
-            loss_dict = {
-                'total': total_loss.item(),
-                'heatmap': loss_heatmap.item(),
-                'kp3d': loss_kp3d.item(),
-            }
-        if sample_weights_3d is not None:
-            loss_dict['hard_w_mean'] = sample_weights_3d.mean().item()
-            loss_dict['hard_w_max'] = sample_weights_3d.max().item()
+        # Total Loss (fixed weighting only)
+        total_loss = (
+            self.heatmap_weight * loss_heatmap +
+            self.kp3d_weight * loss_kp3d  # kp3d_weight=0이면 자동으로 0
+        )
+        loss_dict = {
+            'total': total_loss.item(),
+            'heatmap': loss_heatmap.item(),
+            'kp3d': loss_kp3d.item(),
+        }
         if loss_dict_angle_valid_ratio is not None:
             loss_dict['angle_valid_ratio'] = loss_dict_angle_valid_ratio
 
@@ -554,15 +469,13 @@ class UnifiedPoseLoss(nn.Module):
             n_angle = min(pred_angles.shape[1], gt_angles.shape[1])
             pred_angles = pred_angles[:, :n_angle]
             gt_angles = gt_angles[:, :n_angle]
-            sw_angle = sample_weights_3d
             if angle_valid_mask is not None:
                 pred_angles = pred_angles[angle_valid_mask]
                 gt_angles = gt_angles[angle_valid_mask]
-                sw_angle = sw_angle[angle_valid_mask] if sw_angle is not None else None
             if pred_angles.shape[0] > 0:
                 angle_diff = self.loss_fn(pred_angles, gt_angles)
                 loss_angle, _ = self._reduce_with_optional_weights(
-                    angle_diff, sample_weights=sw_angle
+                    angle_diff, sample_weights=None
                 )
                 total_loss = total_loss + self.angle_weight * loss_angle
                 loss_dict['angle'] = loss_angle.item()
@@ -572,16 +485,14 @@ class UnifiedPoseLoss(nn.Module):
             pred_kp_fk = pred_dict['keypoints_3d_fk']  # (B, 7, 3)
             gt_kp_fk = gt_kp_robot
             valid_mask_fk = valid_mask
-            sw_fk = sample_weights_3d
             if angle_valid_mask is not None:
                 pred_kp_fk = pred_kp_fk[angle_valid_mask]
                 gt_kp_fk = gt_kp_fk[angle_valid_mask]
                 valid_mask_fk = valid_mask_fk[angle_valid_mask] if valid_mask_fk is not None else None
-                sw_fk = sw_fk[angle_valid_mask] if sw_fk is not None else None
             if pred_kp_fk.shape[0] > 0:
                 fk_diff = self.loss_fn(pred_kp_fk, gt_kp_fk)
                 loss_fk_3d, _ = self._reduce_with_optional_weights(
-                    fk_diff, valid_mask=valid_mask_fk, sample_weights=sw_fk, keypoint_weights=self.keypoint_3d_weights
+                    fk_diff, valid_mask=valid_mask_fk, sample_weights=None
                 )
                 total_loss = total_loss + self.fk_3d_weight * loss_fk_3d
                 loss_dict['fk_3d'] = loss_fk_3d.item()
@@ -591,16 +502,14 @@ class UnifiedPoseLoss(nn.Module):
             pred_kp_direct = pred_dict['keypoints_3d_direct']  # (B, 7, 3)
             gt_kp_direct = gt_kp_robot
             valid_mask_direct = valid_mask
-            sw_direct = sample_weights_3d
             if angle_valid_mask is not None:
                 pred_kp_direct = pred_kp_direct[angle_valid_mask]
                 gt_kp_direct = gt_kp_direct[angle_valid_mask]
                 valid_mask_direct = valid_mask_direct[angle_valid_mask] if valid_mask_direct is not None else None
-                sw_direct = sw_direct[angle_valid_mask] if sw_direct is not None else None
             if pred_kp_direct.shape[0] > 0:
                 direct_diff = self.loss_fn(pred_kp_direct, gt_kp_direct)
                 loss_direct_3d, _ = self._reduce_with_optional_weights(
-                    direct_diff, valid_mask=valid_mask_direct, sample_weights=sw_direct, keypoint_weights=self.keypoint_3d_weights
+                    direct_diff, valid_mask=valid_mask_direct, sample_weights=None
                 )
                 total_loss = total_loss + self.direct_3d_weight * loss_direct_3d
                 loss_dict['direct_3d'] = loss_direct_3d.item()
@@ -612,7 +521,7 @@ class UnifiedPoseLoss(nn.Module):
                 pred_dict['keypoints_3d_direct']
             )
             loss_consistency, _ = self._reduce_with_optional_weights(
-                consistency_diff, valid_mask=valid_mask, sample_weights=sample_weights_3d, keypoint_weights=self.keypoint_3d_weights
+                consistency_diff, valid_mask=valid_mask, sample_weights=None
             )
             total_loss = total_loss + self.consistency_weight * loss_consistency
             loss_dict['consistency'] = loss_consistency.item()
@@ -709,21 +618,13 @@ class UnifiedPoseLoss(nn.Module):
                         if valid_mask is not None:
                             valid_mask_subset = valid_mask[valid_indices]  # (N_valid, 7)
                             camera_3d_diff = self.loss_fn(pred_kp_camera, gt_kp_camera_valid)
-                            weight_subset = None
-                            if sample_weights_3d is not None:
-                                index_tensor = torch.as_tensor(valid_indices, dtype=torch.long, device=sample_weights_3d.device)
-                                weight_subset = sample_weights_3d[index_tensor]
                             loss_camera_3d, _ = self._reduce_with_optional_weights(
-                                camera_3d_diff, valid_mask=valid_mask_subset, sample_weights=weight_subset, keypoint_weights=self.keypoint_3d_weights
+                                camera_3d_diff, valid_mask=valid_mask_subset, sample_weights=None
                             )
                         else:
                             camera_3d_diff = self.loss_fn(pred_kp_camera, gt_kp_camera_valid)
-                            weight_subset = None
-                            if sample_weights_3d is not None:
-                                index_tensor = torch.as_tensor(valid_indices, dtype=torch.long, device=sample_weights_3d.device)
-                                weight_subset = sample_weights_3d[index_tensor]
                             loss_camera_3d, _ = self._reduce_with_optional_weights(
-                                camera_3d_diff, sample_weights=weight_subset, keypoint_weights=self.keypoint_3d_weights
+                                camera_3d_diff, sample_weights=None
                             )
 
                         total_loss = total_loss + self.camera_3d_weight * loss_camera_3d
@@ -751,54 +652,6 @@ class UnifiedPoseLoss(nn.Module):
                     import traceback
                     print(f"[Warning] Camera-frame 3D loss failed: {e}\n{traceback.format_exc()}")
                     pass
-
-        # Iterative refinement loss: penalize all intermediate steps with decaying weight
-        if self.refinement_weight > 0 and 'all_refined_angles' in pred_dict and 'angles' in gt_dict:
-            all_angles = pred_dict['all_refined_angles']  # list of (B, 7), length N+1
-            all_kp3d = pred_dict['all_refined_kp3d_robot']  # list of (B, 7, 3), length N+1
-            gt_angles = gt_dict['angles']  # (B, 7)
-            gt_kp_robot = panda_forward_kinematics(gt_angles)  # (B, 7, 3)
-            valid_mask_refine = pred_dict.get('refinement_valid_mask', None)  # (B,)
-
-            N = len(all_angles) - 1  # number of refinement iterations
-            decay = 0.5  # decay factor for earlier iterations
-            refine_loss = torch.tensor(0.0, device=total_loss.device)
-            refine_count = 0
-
-            # Skip index 0 (initial prediction, already covered by angle/fk_3d loss)
-            for step_i in range(1, len(all_angles)):
-                w = decay ** (N - step_i)  # later steps get higher weight
-
-                # Angle loss for this step
-                n_angle = min(all_angles[step_i].shape[1], gt_angles.shape[1])
-                step_angle_diff = self.loss_fn(all_angles[step_i][:, :n_angle], gt_angles[:, :n_angle])
-                step_angle_loss, _ = self._reduce_with_optional_weights(
-                    step_angle_diff, sample_weights=sample_weights_3d
-                )
-
-                # FK 3D loss for this step
-                step_fk_diff = self.loss_fn(all_kp3d[step_i], gt_kp_robot)
-                step_fk_loss, _ = self._reduce_with_optional_weights(
-                    step_fk_diff, valid_mask=valid_mask, sample_weights=sample_weights_3d, keypoint_weights=self.keypoint_3d_weights
-                )
-
-                step_loss = step_angle_loss + step_fk_loss
-
-                # Mask out invalid PnP samples if mask available
-                if valid_mask_refine is not None:
-                    # Only count loss if at least one valid sample
-                    n_valid = valid_mask_refine.float().sum()
-                    if n_valid > 0:
-                        refine_loss = refine_loss + w * step_loss
-                        refine_count += 1
-                else:
-                    refine_loss = refine_loss + w * step_loss
-                    refine_count += 1
-
-            if refine_count > 0:
-                refine_loss = refine_loss / refine_count
-                total_loss = total_loss + self.refinement_weight * refine_loss
-                loss_dict['refinement'] = refine_loss.item()
 
         # Update total in loss_dict
         loss_dict['total'] = total_loss.item()
@@ -848,13 +701,6 @@ class Trainer:
         self.base_lrs = [group['lr'] for group in self.optimizer.param_groups]
         self.freeze_2d_head_epochs = max(0, int(config.get('freeze_2d_head_epochs', 0)))
         self._is_2d_head_frozen = False
-        # Hard-batch replay: revisit difficult batches more often within an epoch.
-        self.hard_replay = bool(config.get('hard_replay', True))
-        self.hard_replay_metric = str(config.get('hard_replay_metric', 'camera_3d'))
-        self.hard_replay_ratio = float(config.get('hard_replay_ratio', 0.2))
-        self.hard_replay_margin = float(config.get('hard_replay_margin', 1.15))
-        self.hard_replay_loss_scale = float(config.get('hard_replay_loss_scale', 0.7))
-        self.hard_replay_min_epoch = int(config.get('hard_replay_min_epoch', 1))
         self.train_focus_loss_scale = float(config.get('train_focus_loss_scale', 1.0))
 
         # Create output directory (only on main process)
@@ -1238,10 +1084,6 @@ class Trainer:
         ('camera_3d', 'cam3d'),
         ('pnp_success_rate', 'pnp'),
         ('angle_valid_ratio', 'avr'),
-        ('replay_rate', 'rpl'),
-        ('refinement', 'ref'),
-        ('hard_w_mean', 'hwm'),
-        ('hard_w_max', 'hwx'),
     ]
 
     def _show_kp3d_log(self):
@@ -1289,16 +1131,13 @@ class Trainer:
             'kp3d': [],
         }
 
-        def _run_one_loader(loader, desc, apply_hard_replay=True, loss_scale=1.0, log_prefix='batch/train'):
+        def _run_one_loader(loader, desc, loss_scale=1.0, log_prefix='batch/train'):
             nonlocal epoch_losses
             if self.is_main_process:
                 iter_loader = tqdm(loader, desc=desc)
             else:
                 iter_loader = loader
 
-            max_replays = int(len(loader) * max(0.0, self.hard_replay_ratio))
-            replay_count = 0
-            hard_metric_ema = None
             batch_idx = 0
 
             for batch in iter_loader:
@@ -1319,37 +1158,6 @@ class Trainer:
                 self.optimizer.step()
                 self.global_step += 1
 
-                replay_triggered = False
-                if apply_hard_replay and self.hard_replay and epoch >= self.hard_replay_min_epoch and replay_count < max_replays:
-                    metric_key = self.hard_replay_metric
-                    metric_val = float(loss_dict.get(metric_key, loss_dict['total']))
-                    if hard_metric_ema is None:
-                        hard_metric_ema = metric_val
-                    else:
-                        hard_metric_ema = 0.95 * hard_metric_ema + 0.05 * metric_val
-
-                    if metric_val > hard_metric_ema * self.hard_replay_margin:
-                        replay_triggered = True
-                        replay_count += 1
-                        pred_dict_replay = self.model(
-                            images, camera_K=camera_K, original_size=orig_size_list,
-                            gt_angles=gt_angles, gt_2d_image=gt_2d_image
-                        )
-                        replay_loss, replay_loss_dict = self.criterion(pred_dict_replay, gt_dict)
-                        replay_loss = replay_loss * self.hard_replay_loss_scale * float(loss_scale)
-                        self.optimizer.zero_grad()
-                        replay_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                        self.optimizer.step()
-                        self.global_step += 1
-
-                        for k, v in replay_loss_dict.items():
-                            replay_key = f"replay_{k}"
-                            if replay_key not in epoch_losses:
-                                epoch_losses[replay_key] = []
-                            epoch_losses[replay_key].append(v)
-
-                loss_dict['replay_rate'] = 1.0 if replay_triggered else 0.0
                 for key, value in loss_dict.items():
                     if key not in epoch_losses:
                         epoch_losses[key] = []
@@ -1369,23 +1177,18 @@ class Trainer:
                                                     ('fk_3d', f'{log_prefix}_fk3d_loss'),
                                                     ('camera_3d', f'{log_prefix}_camera3d_loss'),
                                                     ('angle_valid_ratio', f'{log_prefix}_angle_valid_ratio'),
-                                                    ('replay_rate', f'{log_prefix}_replay_rate'),
-                                                    ('hard_w_mean', f'{log_prefix}_hard_w_mean'),
-                                                    ('hard_w_max', f'{log_prefix}_hard_w_max'),
-                                                    ('pnp_success_rate', f'{log_prefix}_pnp_success_rate'),
-                                                    ('refinement', f'{log_prefix}_refinement_loss')]:
+                                                    ('pnp_success_rate', f'{log_prefix}_pnp_success_rate')]:
                                 if key in loss_dict:
                                     batch_log[wandb_key] = loss_dict[key]
                             wandb.log(batch_log, step=self.global_step)
                         except Exception:
                             pass
 
-        _run_one_loader(self.train_loader, f'Epoch {epoch} [Train]', apply_hard_replay=True, loss_scale=1.0, log_prefix='batch/train')
+        _run_one_loader(self.train_loader, f'Epoch {epoch} [Train]', loss_scale=1.0, log_prefix='batch/train')
         if self.train_focus_loader is not None and len(self.train_focus_loader) > 0:
             _run_one_loader(
                 self.train_focus_loader,
                 f'Epoch {epoch} [Train-JSON]',
-                apply_hard_replay=False,
                 loss_scale=self.train_focus_loss_scale,
                 log_prefix='batch/train_focus'
             )
@@ -1535,8 +1338,6 @@ class Trainer:
                     postfix['fdlt'] = f"{loss_dict['fusion_delta']:.6f}"
                 if 'camera_3d' in loss_dict:
                     postfix['cam3d'] = f"{loss_dict['camera_3d']:.6f}"
-                if 'refinement' in loss_dict:
-                    postfix['ref'] = f"{loss_dict['refinement']:.6f}"
                 pbar.set_postfix(postfix)
 
         # Average losses
@@ -1672,8 +1473,6 @@ class Trainer:
                         log_dict['train/fk3d_loss'] = train_losses['fk_3d']
                     if 'camera_3d' in train_losses:
                         log_dict['train/camera3d_loss'] = train_losses['camera_3d']
-                    if 'refinement' in train_losses:
-                        log_dict['train/refinement_loss'] = train_losses['refinement']
                     if 'pnp_success_rate' in train_losses:
                         log_dict['train/pnp_success_rate'] = train_losses['pnp_success_rate']
                     # Add all validation metrics
@@ -1703,8 +1502,6 @@ class Trainer:
                     train_extra += f", fdlt: {train_losses['fusion_delta']:.6f}"
                 if 'camera_3d' in train_losses:
                     train_extra += f", cam3d: {train_losses['camera_3d']:.6f}"
-                if 'refinement' in train_losses:
-                    train_extra += f", ref: {train_losses['refinement']:.6f}"
                 if 'angle' in val_losses:
                     val_extra += f", ang: {val_losses['angle']:.6f}"
                 if 'fk_3d' in val_losses:
@@ -1717,8 +1514,6 @@ class Trainer:
                     val_extra += f", fdlt: {val_losses['fusion_delta']:.6f}"
                 if 'camera_3d' in val_losses:
                     val_extra += f", cam3d: {val_losses['camera_3d']:.6f}"
-                if 'refinement' in val_losses:
-                    val_extra += f", ref: {val_losses['refinement']:.6f}"
                 if self._show_kp3d_log() and ('kp3d' in train_losses) and ('kp3d' in val_losses):
                     print(f"  Train Loss: {train_losses['total']:.6f} (hm: {train_losses['heatmap']:.6f}, kp3d: {train_losses['kp3d']:.6f}{train_extra})")
                     print(f"  Val Loss:   {val_losses['total']:.6f} (hm: {val_losses['heatmap']:.6f}, kp3d: {val_losses['kp3d']:.6f}{val_extra})")
@@ -1887,28 +1682,6 @@ def load_2d_head_weights(model, checkpoint_path, is_distributed=False, is_main_p
         raise
 
 
-def worker_init_fn(worker_id):
-    """
-    DataLoader worker initialization function for reproducibility
-    Each worker gets a different but deterministic seed
-    """
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
-
-def parse_keypoint_3d_weights_arg(raw: str):
-    """Parse comma-separated keypoint weights; allow optional [] wrapper."""
-    if raw is None:
-        return None
-    text = str(raw).strip()
-    if not text:
-        return None
-    text = text.strip("[](){}")
-    vals = [v.strip() for v in text.split(",") if v.strip()]
-    return [float(v) for v in vals] if vals else None
-
-
 def main(args):
     # Setup distributed training
     local_rank, rank, world_size = setup_distributed()
@@ -1977,8 +1750,6 @@ def main(args):
                     image_size=(args.image_size, args.image_size),
                     heatmap_size=(args.heatmap_size, args.heatmap_size),
                     augment=True,
-                    multi_robot=args.multi_robot,
-                    robot_types=args.robot_types,
                     fda_real_dir=args.fda_real_dir,
                     fda_beta=args.fda_beta,
                     fda_prob=args.fda_prob,
@@ -1996,8 +1767,6 @@ def main(args):
             image_size=(args.image_size, args.image_size),
             heatmap_size=(args.heatmap_size, args.heatmap_size),
             augment=False,
-            multi_robot=args.multi_robot,
-            robot_types=args.robot_types,
             fda_real_dir=None,
             fda_beta=args.fda_beta,
             fda_prob=0.0,
@@ -2014,8 +1783,6 @@ def main(args):
                         image_size=(args.image_size, args.image_size),
                         heatmap_size=(args.heatmap_size, args.heatmap_size),
                         augment=True,
-                        multi_robot=args.multi_robot,
-                        robot_types=args.robot_types,
                         fda_real_dir=args.fda_real_dir,
                         fda_beta=args.fda_beta,
                         fda_prob=args.fda_prob,
@@ -2086,8 +1853,6 @@ def main(args):
             image_size=(args.image_size, args.image_size),
             heatmap_size=(args.heatmap_size, args.heatmap_size),
             augment=False,  # Temporarily disable to get indices
-            multi_robot=args.multi_robot,
-            robot_types=args.robot_types,
             fda_real_dir=args.fda_real_dir,
             fda_beta=args.fda_beta,
             fda_prob=args.fda_prob,
@@ -2110,8 +1875,6 @@ def main(args):
             image_size=(args.image_size, args.image_size),
             heatmap_size=(args.heatmap_size, args.heatmap_size),
             augment=False,  # Disable augmentation for training
-            multi_robot=args.multi_robot,
-            robot_types=args.robot_types,
             fda_real_dir=args.fda_real_dir,
             fda_beta=args.fda_beta,
             fda_prob=args.fda_prob,
@@ -2127,8 +1890,6 @@ def main(args):
             image_size=(args.image_size, args.image_size),
             heatmap_size=(args.heatmap_size, args.heatmap_size),
             augment=False,  # Disable augmentation for validation
-            multi_robot=args.multi_robot,
-            robot_types=args.robot_types,
             fda_real_dir=None,  # No FDA for validation
             fda_beta=args.fda_beta,
             fda_prob=0.0,  # No FDA for validation
@@ -2142,8 +1903,6 @@ def main(args):
                 image_size=(args.image_size, args.image_size),
                 heatmap_size=(args.heatmap_size, args.heatmap_size),
                 augment=True,
-                multi_robot=args.multi_robot,
-                robot_types=args.robot_types,
                 fda_real_dir=args.fda_real_dir,
                 fda_beta=args.fda_beta,
                 fda_prob=args.fda_prob,
@@ -2196,7 +1955,6 @@ def main(args):
             sampler=train_sampler,
             num_workers=args.num_workers,
             pin_memory=True
-            # worker_init_fn=worker_init_fn
         )
 
         val_loader = DataLoader(
@@ -2206,7 +1964,6 @@ def main(args):
             sampler=val_sampler,
             num_workers=args.num_workers,
             pin_memory=True
-            # worker_init_fn=worker_init_fn
         )
 
     if is_main_process:
@@ -2250,86 +2007,36 @@ def main(args):
             if is_main_process:
                 print(f"Warning: Failed to load camera settings: {e}")
 
-    # Simplified training mode: iterative refinement is intentionally disabled.
-    if getattr(args, 'use_iterative_refinement', False) and is_main_process:
-        print("Warning: --use-iterative-refinement is ignored in simplified mode.")
-    use_iter_refine = False
-    heatmap_only_train = getattr(args, 'heatmap_only_train', False)
+    # Simplified training mode: iterative refinement and heatmap-only branch are removed.
     freeze_2d_head_epochs = max(0, int(getattr(args, 'freeze_2d_head_epochs', 0)))
     has_2d_source = bool(args.load_2d_head) or bool(args.resume)
     if freeze_2d_head_epochs > 0 and not has_2d_source and is_main_process:
         print("Warning: --freeze-2d-head-epochs is set but neither --load-2d-head nor --resume is provided. Freeze schedule will be ignored.")
-    if heatmap_only_train and freeze_2d_head_epochs > 0 and is_main_process:
-        print("Warning: --heatmap-only-train with --freeze-2d-head-epochs would freeze all trainable branches. Freeze schedule will be ignored.")
-    if (not has_2d_source) or heatmap_only_train:
+    if not has_2d_source:
         freeze_2d_head_epochs = 0
-    effective_use_iter_refine = False
 
     if is_main_process:
-        keypoint_3d_weights = None
-        if args.keypoint_3d_weights.strip():
-            keypoint_3d_weights = parse_keypoint_3d_weights_arg(args.keypoint_3d_weights)
-            if len(keypoint_3d_weights) != len(keypoint_names):
-                raise ValueError(
-                    f"--keypoint-3d-weights expects {len(keypoint_names)} values "
-                    f"(got {len(keypoint_3d_weights)}): {args.keypoint_3d_weights}"
-                )
-            kp_w_log = ", ".join(f"{k}:{w:.2f}" for k, w in zip(keypoint_names, keypoint_3d_weights))
-            print(f"3D keypoint weights: {kp_w_log}")
-        else:
-            keypoint_3d_weights = None
-
         print(f"3D prediction mode: joint_angle")
         print(
             f"Optimization config: optimizer={args.optimizer}, "
             f"scheduler={args.scheduler}, lr={args.learning_rate:.2e}, "
             f"warmup_steps={args.warmup_steps}, warmup_start_lr={args.warmup_start_lr:.2e}, "
             f"freeze_2d_head_epochs={freeze_2d_head_epochs}, "
-            f"hard3d={'on' if args.use_hard_sample_3d_reweight else 'off'}, "
-            f"hard_replay={'on' if args.hard_replay else 'off'}({args.hard_replay_metric},"
-            f" ratio={args.hard_replay_ratio}, margin={args.hard_replay_margin}), "
             f"train_json_list={'set' if args.train_json_list else 'none'}, "
             f"train_json_mode={args.train_json_list_mode}, "
             f"val_json_list={'set' if args.val_json_list else 'none'}, "
-            f"heatmap_only={'yes' if heatmap_only_train else 'no'}, "
             f"resume={'yes' if args.resume else 'no'}"
         )
-    else:
-        if args.keypoint_3d_weights.strip():
-            keypoint_3d_weights = parse_keypoint_3d_weights_arg(args.keypoint_3d_weights)
-            if len(keypoint_3d_weights) != len(keypoint_names):
-                raise ValueError(
-                    f"--keypoint-3d-weights expects {len(keypoint_names)} values "
-                    f"(got {len(keypoint_3d_weights)})"
-                )
-        else:
-            keypoint_3d_weights = None
-
-    refine_iters = 0
 
     model = DINOv3PoseEstimator(
         dino_model_name=args.model_name,
         heatmap_size=(args.heatmap_size, args.heatmap_size),
         unfreeze_blocks=args.unfreeze_blocks,
         use_joint_embedding=args.use_joint_embedding,
-        use_iterative_refinement=effective_use_iter_refine,
-        refinement_iterations=refine_iters,
+        use_iterative_refinement=False,
+        refinement_iterations=0,
         fix_joint7_zero=args.fix_joint7_zero,
     ).to(device)
-
-    # 2D heatmap-only training: freeze 3D-related heads
-    if heatmap_only_train:
-        for p in model.joint_angle_head.parameters():
-            p.requires_grad = False
-        if hasattr(model, 'direct_3d_head') and model.direct_3d_head is not None:
-            for p in model.direct_3d_head.parameters():
-                p.requires_grad = False
-        if hasattr(model, 'fusion_head') and model.fusion_head is not None:
-            for p in model.fusion_head.parameters():
-                p.requires_grad = False
-        if model.refinement_module is not None:
-            for p in model.refinement_module.parameters():
-                p.requires_grad = False
 
     # Wrap model with DistributedDataParallel for multi-GPU training
     if is_distributed:
@@ -2348,7 +2055,7 @@ def main(args):
         print(f"Model: {args.model_name}")
         print(f"Joint Embedding: {'Enabled' if args.use_joint_embedding else 'Disabled'}")
         print(f"Fix joint7=0: {'Enabled' if args.fix_joint7_zero else 'Disabled'}")
-        print(f"Training Mode: {'2D heatmap-only' if heatmap_only_train else 'Full (2D + 3D)'}")
+        print("Training Mode: Full (2D + 3D)")
         print(f"Fine-tuning: Partial (Last {args.unfreeze_blocks} blocks)")
 
         model_to_count = model.module if is_distributed else model
@@ -2365,10 +2072,9 @@ def main(args):
         )
 
     # Loss function
-    angle_w = 0.0 if heatmap_only_train else args.angle_weight
-    fk_3d_w = 0.0 if heatmap_only_train else args.fk_3d_weight
-    camera_3d_w = 0.0 if heatmap_only_train else args.kp3d_weight  # Camera-frame 3D loss
-    refinement_w = 0.0
+    angle_w = args.angle_weight
+    fk_3d_w = args.fk_3d_weight
+    camera_3d_w = args.kp3d_weight  # Camera-frame 3D loss
     # Joint-angle + EPNP matching mode (RoboPEPP-style): disable direct/fusion side objectives.
     direct_3d_w = 0.0
     consistency_w = 0.0
@@ -2383,14 +2089,9 @@ def main(args):
         fk_3d_weight=fk_3d_w,
         camera_3d_weight=camera_3d_w,  # Camera-frame 3D loss (PnP-based transform)
         loss_type=args.loss_type,  # Loss function type: 'mse', 'l1', 'smoothl1'
-        refinement_weight=refinement_w,  # Iterative refinement loss weight
         direct_3d_weight=direct_3d_w,
         consistency_weight=consistency_w,
         fusion_delta_weight=fusion_delta_w,
-        use_hard_sample_3d_reweight=(not heatmap_only_train) and args.use_hard_sample_3d_reweight,
-        hard_sample_3d_power=args.hard_sample_3d_power,
-        hard_sample_3d_max_weight=args.hard_sample_3d_max_weight,
-        keypoint_3d_weights=keypoint_3d_weights,
     ).to(device)
 
     # Optimizer
@@ -2453,21 +2154,11 @@ def main(args):
         'use_joint_embedding': args.use_joint_embedding,
         'fix_joint7_zero': args.fix_joint7_zero,
         'joint_angle_3d': True,
-        'heatmap_only_train': heatmap_only_train,
         'angle_weight': angle_w,
         'fk_3d_weight': fk_3d_w,
         'direct_3d_weight': direct_3d_w,
         'consistency_weight': consistency_w,
         'fusion_delta_weight': fusion_delta_w,
-        'use_hard_sample_3d_reweight': (not heatmap_only_train) and args.use_hard_sample_3d_reweight,
-        'hard_sample_3d_power': args.hard_sample_3d_power,
-        'hard_sample_3d_max_weight': args.hard_sample_3d_max_weight,
-        'hard_replay': args.hard_replay,
-        'hard_replay_metric': args.hard_replay_metric,
-        'hard_replay_ratio': args.hard_replay_ratio,
-        'hard_replay_margin': args.hard_replay_margin,
-        'hard_replay_loss_scale': args.hard_replay_loss_scale,
-        'hard_replay_min_epoch': args.hard_replay_min_epoch,
         'train_json_list': args.train_json_list,
         'train_json_list_mode': args.train_json_list_mode,
         'train_focus_loss_scale': args.train_json_extra_loss_scale,
@@ -2475,10 +2166,6 @@ def main(args):
         'occlusion_prob': args.occlusion_prob,
         'occlusion_max_holes': args.occlusion_max_holes,
         'occlusion_max_size_frac': args.occlusion_max_size_frac,
-        'keypoint_3d_weights': keypoint_3d_weights,
-        'use_iterative_refinement': False,
-        'refinement_iterations': 0,
-        'refinement_weight': refinement_w,
         'batch_size': args.batch_size,
         'epochs': args.epochs,
         'optimizer': args.optimizer,
@@ -2535,10 +2222,6 @@ if __name__ == '__main__':
                         help='Train/val split ratio if val-dir not provided (DREAM uses 0.8, we use 0.9)')
     parser.add_argument('--val-split', type=float, default=1.0,
                         help='Fraction of validation data to use (default=1.0 for all data)')
-    parser.add_argument('--multi-robot', action='store_true',
-                        help='Load data from multiple robot subdirectories for unified model')
-    parser.add_argument('--robot-types', type=str, nargs='+', default=None,
-                        help='Filter specific robot types (e.g., panda kuka baxter)')
     parser.add_argument('--train-json-list', type=str, default=None,
                         help='Path to txt/json allowlist for training frames (json names/paths)')
     parser.add_argument('--train-json-list-mode', type=str, default='extra', choices=['extra', 'filter'],
@@ -2621,43 +2304,10 @@ if __name__ == '__main__':
                         help='Weight for joint angle MSE loss (joint_angle mode)')
     parser.add_argument('--fk-3d-weight', type=float, default=10.0,
                         help='Weight for FK 3D keypoint MSE loss (joint_angle mode)')
-    parser.add_argument('--direct-3d-weight', type=float, default=0.0,
-                        help='Deprecated in FK-only mode (kept for compatibility, ignored)')
     parser.add_argument('--consistency-weight', type=float, default=0.0,
                         help='Deprecated in FK-only mode (kept for compatibility, ignored)')
     parser.add_argument('--fusion-delta-weight', type=float, default=0.0,
                         help='Deprecated in FK-only mode (kept for compatibility, ignored)')
-    parser.add_argument('--use-hard-sample-3d-reweight', action='store_true', default=False,
-                        help='Enable train-time hard sample reweighting for 3D-related losses')
-    parser.add_argument('--hard-sample-3d-power', type=float, default=1.0,
-                        help='Exponent for hard sample weighting: w=(err/mean_err)^power')
-    parser.add_argument('--hard-sample-3d-max-weight', type=float, default=3.0,
-                        help='Maximum hard sample weight clamp')
-    parser.add_argument('--hard-replay', action=argparse.BooleanOptionalAction, default=True,
-                        help='Replay difficult batches once more within the same epoch')
-    parser.add_argument('--hard-replay-metric', type=str, default='camera_3d',
-                        choices=['camera_3d', 'fk_3d', 'angle', 'total'],
-                        help='Metric used to detect difficult batches for replay')
-    parser.add_argument('--hard-replay-ratio', type=float, default=0.2,
-                        help='Maximum replayed-batch ratio per epoch (0.2 means 20%% of steps)')
-    parser.add_argument('--hard-replay-margin', type=float, default=1.15,
-                        help='Replay if metric > EMA * margin')
-    parser.add_argument('--hard-replay-loss-scale', type=float, default=0.7,
-                        help='Scale factor for replay loss to keep updates stable')
-    parser.add_argument('--hard-replay-min-epoch', type=int, default=1,
-                        help='Start replay after this epoch (inclusive)')
-    parser.add_argument('--keypoint-3d-weights', type=str, default='',
-                        help='Comma-separated per-keypoint weights for 3D losses (7 values)')
-
-    # Iterative Refinement
-    parser.add_argument('--use-iterative-refinement', action='store_true', default=False,
-                        help='Enable iterative refinement for joint angle mode')
-    parser.add_argument('--heatmap-only-train', action='store_true', default=False,
-                        help='Train only 2D heatmap branch (freeze 3D heads and disable 3D losses)')
-    parser.add_argument('--refinement-iterations', type=int, default=3,
-                        help='Number of refinement iterations')
-    parser.add_argument('--refinement-weight', type=float, default=50.0,
-                        help='Weight for iterative refinement loss')
 
     # Output
     parser.add_argument('--output-dir', type=str, default='./outputs',
