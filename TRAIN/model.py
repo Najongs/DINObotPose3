@@ -122,29 +122,59 @@ class TokenFuser(nn.Module):
         residual = self.residual_conv(x)
         return torch.nn.functional.gelu(refined + residual)
 
+class SpatialGlobalModulation(nn.Module):
+    """ DINOv3의 전역 문맥(Global Context)을 CNN 피처맵에 강제로 주입하는 FiLM 모듈 """
+    def __init__(self, global_dim, feature_dim):
+        super().__init__()
+        # 글로벌 벡터를 받아서 피처맵 채널 수의 2배(Gamma, Beta) 크기로 확장
+        self.mlp = nn.Sequential(
+            nn.Linear(global_dim, feature_dim * 2),
+            nn.GELU(),
+            nn.Linear(feature_dim * 2, feature_dim * 2)
+        )
+
+    def forward(self, x, global_context):
+        # x: (B, feature_dim, H, W) - 현재 디코더의 로컬 피처맵
+        # global_context: (B, global_dim) - DINOv3 전체 요약 벡터
+        
+        gamma_beta = self.mlp(global_context) # (B, feature_dim * 2)
+        gamma, beta = gamma_beta.chunk(2, dim=1) # 각각 (B, feature_dim)
+        
+        # 공간 차원(H, W)에 브로드캐스팅하기 위해 차원 추가
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+        
+        # FiLM 연산: 피처맵에 글로벌 정보 곱하고 더하기
+        return x * (1 + gamma) + beta
+
 class ViTKeypointHead(nn.Module):
-    def __init__(self, input_dim=768, num_joints=NUM_JOINTS, heatmap_size=(512, 512)):
+    def __init__(self, input_dim=768, num_joints=7, heatmap_size=(512, 512)):
         super().__init__()
         self.heatmap_size = heatmap_size
         self.token_fuser = TokenFuser(input_dim, 256)
 
+        # --- 🚀 [NEW] 디코더 블록마다 글로벌 정보를 쏴줄 모듈 정의 ---
+        # DINOv3 원본 피처(768)를 요약한 벡터를 글로벌 정보로 사용
+        self.global_mod1 = SpatialGlobalModulation(global_dim=input_dim, feature_dim=256)
+        self.global_mod2 = SpatialGlobalModulation(global_dim=input_dim, feature_dim=128)
+        self.global_mod3 = SpatialGlobalModulation(global_dim=input_dim, feature_dim=64)
+
         # ViT-only decoder with Sub-Pixel Convolution (PixelShuffle)
-        # PixelShuffle: 초해상도 표준 기법, edge 보존 우수, checkerboard artifact 없음
         self.decoder_block1 = nn.Sequential(
-            nn.Conv2d(256, 128 * 4, kernel_size=3, padding=1, bias=False),  # 4 = 2^2 for 2x upsampling
-            nn.PixelShuffle(upscale_factor=2),  # (B, 128*4, H, W) -> (B, 128, H*2, W*2)
+            nn.Conv2d(256, 128 * 4, kernel_size=3, padding=1, bias=False),  
+            nn.PixelShuffle(upscale_factor=2),  
             AdaptiveNorm2d(128, num_groups=32),
             nn.GELU()
         )
         self.decoder_block2 = nn.Sequential(
             nn.Conv2d(128, 64 * 4, kernel_size=3, padding=1, bias=False),
-            nn.PixelShuffle(upscale_factor=2),  # 2x upsampling
+            nn.PixelShuffle(upscale_factor=2),  
             AdaptiveNorm2d(64, num_groups=16),
             nn.GELU()
         )
         self.decoder_block3 = nn.Sequential(
             nn.Conv2d(64, 32 * 4, kernel_size=3, padding=1, bias=False),
-            nn.PixelShuffle(upscale_factor=2),  # 2x upsampling
+            nn.PixelShuffle(upscale_factor=2),  
             AdaptiveNorm2d(32, num_groups=8),
             nn.GELU()
         )
@@ -152,12 +182,11 @@ class ViTKeypointHead(nn.Module):
         self.heatmap_predictor = nn.Conv2d(32, num_joints, kernel_size=3, padding=1)
 
         # Final upsampling with Sub-Pixel Convolution (4x = 2x × 2x)
-        # PixelShuffle은 ConvTranspose2d보다 checkerboard artifact가 적고 edge detail 보존 우수
         self.final_upsample = nn.Sequential(
             nn.Conv2d(num_joints, num_joints * 4, kernel_size=3, padding=1, bias=False),
-            nn.PixelShuffle(upscale_factor=2),  # 2x upsampling
+            nn.PixelShuffle(upscale_factor=2),  
             nn.Conv2d(num_joints, num_joints * 4, kernel_size=3, padding=1, bias=False),
-            nn.PixelShuffle(upscale_factor=2)   # 2x upsampling (total 4x)
+            nn.PixelShuffle(upscale_factor=2)   
         )
 
     def forward(self, dino_features):
@@ -167,19 +196,31 @@ class ViTKeypointHead(nn.Module):
         if h * w != n:
             n_new = h * w
             dino_features = dino_features[:, :n_new, :]
+        
+        # 1. 2D 공간 피처로 변환
         x = dino_features.permute(0, 2, 1).reshape(b, d, h, w)
 
+        # --- 🚀 [NEW] 2. DINOv3 피처에서 글로벌 컨텍스트(요약본) 추출 ---
+        # Global Average Pooling을 통해 전체 이미지의 문맥을 (B, d) 벡터로 압축
+        global_context = F.adaptive_avg_pool2d(x, 1).flatten(1)
+
+        # 3. Fuser 통과
         x = self.token_fuser(x)
-        x = self.decoder_block1(x)
-        x = self.decoder_block2(x)
-        x = self.decoder_block3(x)
 
+        # 4. 디코더 통과 시마다 글로벌 문맥 지속 주입 (FiLM)
+        x = self.global_mod1(x, global_context) # 글로벌 정보 묻히기
+        x = self.decoder_block1(x)              # 업샘플링
+
+        x = self.global_mod2(x, global_context) # 글로벌 정보 묻히기
+        x = self.decoder_block2(x)              # 업샘플링
+
+        x = self.global_mod3(x, global_context) # 글로벌 정보 묻히기
+        x = self.decoder_block3(x)              # 업샘플링
+
+        # 5. 최종 히트맵 예측 및 리사이즈
         heatmaps = self.heatmap_predictor(x)
-
-        # Use learned upsampling instead of bilinear interpolation
         heatmaps = self.final_upsample(heatmaps)
 
-        # Final resize to exact target size if needed
         if heatmaps.shape[2:] != self.heatmap_size:
             heatmaps = F.interpolate(heatmaps, size=self.heatmap_size, mode='bilinear', align_corners=False)
 
@@ -365,40 +406,45 @@ def panda_forward_kinematics(joint_angles):
 class JointAngleHead(nn.Module):
     """
     Predicts Panda joint angles (6 or 7 DoF) from visual features + heatmaps.
-    Uses FK to produce 3D keypoints in robot base frame.
+    [IMPROVED]: Added Confidence Gating & Global Context for occlusion robustness.
     """
 
-    def __init__(self, input_dim=FEATURE_DIM, num_joints=NUM_JOINTS, num_angles=7, use_joint_embedding=False):
+    def __init__(self, input_dim=768, num_joints=7, num_angles=7, use_joint_embedding=True):
         super().__init__()
         self.num_joints = num_joints
         self.num_angles = num_angles
         self.hidden_dim = 256
         self.use_joint_embedding = use_joint_embedding
 
-        # Joint limits as buffers (optionally use only first 6 for RoboPEPP-style mode)
-        limits = torch.tensor(_PANDA_JOINT_LIMITS, dtype=torch.float32)  # (7, 2)
+        # (기존 Joint limits 설정 코드는 동일하게 유지)
+        limits = torch.tensor(_PANDA_JOINT_LIMITS, dtype=torch.float32)  
         limits = limits[:self.num_angles]
         self.register_buffer('joint_lower', limits[:, 0])
         self.register_buffer('joint_upper', limits[:, 1])
         self.register_buffer('joint_mid', (limits[:, 0] + limits[:, 1]) / 2)
         self.register_buffer('joint_range', (limits[:, 1] - limits[:, 0]) / 2)
 
-        # Learnable temperature for soft-argmax
         self.temperature = nn.Parameter(torch.tensor(10.0))
 
         # 1. Per-joint feature refinement
-        # Input: visual feature (input_dim) + normalized 2D coords (2)
         self.joint_feature_net = nn.Sequential(
             nn.Linear(input_dim + 2, self.hidden_dim),
             nn.GELU(),
             nn.LayerNorm(self.hidden_dim)
         )
 
-        # Joint identity embedding: "이 토큰은 1번 모터(Base)입니다" / "이 토큰은 7번 모터(Wrist)입니다"
-        if use_joint_embedding:
-            self.joint_embedding = nn.Embedding(num_joints, self.hidden_dim)
+        # 🚀 [NEW] 전역 문맥(Global Context)을 위한 선형 변환기
+        self.global_feature_net = nn.Sequential(
+            nn.Linear(input_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.hidden_dim)
+        )
 
-        # 2. Self-attention for kinematic constraint learning (reduced from 4 to 2 layers)
+        if use_joint_embedding:
+            # 관절 이름표 (7개) + 글로벌 토큰용 이름표 (1개) = 총 8개
+            self.joint_embedding = nn.Embedding(num_joints + 1, self.hidden_dim)
+
+        # 2. Self-attention
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.hidden_dim,
             nhead=8,
@@ -409,7 +455,7 @@ class JointAngleHead(nn.Module):
         )
         self.joint_relation_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
-        # 3. Global angle decoding (stable baseline).
+        # 3. Global angle decoding
         self.global_angle_predictor = nn.Sequential(
             nn.Linear(self.hidden_dim, 256),
             nn.GELU(),
@@ -417,48 +463,42 @@ class JointAngleHead(nn.Module):
             nn.Linear(256, self.num_angles)
         )
 
-        # 4. Per-joint residual correction after contextual interaction.
+        # 4. Per-joint residual correction
         self.per_joint_residual_head = nn.Sequential(
             nn.Linear(self.hidden_dim, 128),
             nn.GELU(),
             nn.LayerNorm(128),
             nn.Linear(128, 1)
         )
-        # Safety path when num_joints != num_angles (keeps API generic).
         self.residual_mixer = nn.Identity() if self.num_joints == self.num_angles else nn.Linear(self.num_joints, self.num_angles)
-        # Small learnable gate keeps residual branch from destabilizing early training.
         self.residual_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, dino_features, predicted_heatmaps):
-        """
-        Args:
-            dino_features: (B, N, D) backbone patch tokens
-            predicted_heatmaps: (B, NUM_JOINTS, H, W) 2D belief maps
-        Returns:
-            joint_angles: (B, num_angles) predicted joint angles (radians, within limits)
-            keypoints_3d_robot: (B, 7, 3) FK-computed 3D keypoints in robot base frame
-        """
         b, n, d = dino_features.shape
         h = w = int(math.sqrt(n))
 
         feat_map = dino_features.permute(0, 2, 1).reshape(b, d, h, w)
 
-        # Extract 2D keypoint locations from heatmaps with learnable temperature
+        # 1. Soft-argmax로 2D 좌표 추출
         uv_heatmap = soft_argmax_2d(predicted_heatmaps, self.temperature)  # (B, NJ, 2)
 
-        # Normalize 2D coords to [-1, 1] (in-place 회피)
+        # 🚀 [NEW] 2. 히트맵에서 신뢰도(Confidence) 추출 (Softmax or Sigmoid)
+        # 히트맵의 각 관절별 최대 활성화 값을 뽑아내어 [0, 1] 사이로 스케일링
+        confidence = torch.amax(predicted_heatmaps, dim=(2, 3)) # (B, NJ)
+        confidence = torch.sigmoid(confidence).unsqueeze(-1)    # (B, NJ, 1)
+
+        # Normalize 2D coords
         hm_h, hm_w = predicted_heatmaps.shape[2], predicted_heatmaps.shape[3]
         uv_norm_x = (uv_heatmap[:, :, 0] / hm_w) * 2.0 - 1.0
         uv_norm_y = (uv_heatmap[:, :, 1] / hm_h) * 2.0 - 1.0
-        uv_normalized = torch.stack([uv_norm_x, uv_norm_y], dim=-1)  # (B, NJ, 2)
+        uv_normalized = torch.stack([uv_norm_x, uv_norm_y], dim=-1)
 
-        # Scale keypoint coords from heatmap space to feature map space (ROIAlign용)
         scale_x = w / hm_w
         scale_y = h / hm_h
         uv_feat = torch.stack([uv_heatmap[:, :, 0] * scale_x,
-                               uv_heatmap[:, :, 1] * scale_y], dim=-1)  # (B, NJ, 2)
+                               uv_heatmap[:, :, 1] * scale_y], dim=-1)
 
-        # Create RoI boxes — 벡터화 (roi_size=2: keypoint 겹침 방지)
+        # RoI extraction
         roi_size = 4
         batch_ids = torch.arange(b, device=feat_map.device, dtype=torch.float32).unsqueeze(1).expand(b, self.num_joints)
         cx = uv_feat[:, :, 0]
@@ -466,153 +506,60 @@ class JointAngleHead(nn.Module):
         rois = torch.stack([batch_ids, cx - roi_size/2, cy - roi_size/2,
                             cx + roi_size/2, cy + roi_size/2], dim=-1).reshape(-1, 5).detach()
 
-        # ROIAlign + pooling
         roi_features = roi_align(feat_map, rois, output_size=(3, 3), spatial_scale=1.0)
-        joint_features = roi_features.mean(dim=[2, 3])
-        joint_features = joint_features.view(b, self.num_joints, d)
+        joint_features = roi_features.mean(dim=[2, 3]).view(b, self.num_joints, d)
 
-        # Concatenate 2D coordinates
-        joint_features = torch.cat([joint_features, uv_normalized], dim=-1)  # (B, NJ, D+2)
+        # 🚀 [NEW] 3. 신뢰도 게이팅 (Confidence Gating) 적용!
+        # 가려져서 확신이 없는(confidence가 낮은) 쓰레기 RoI 피처의 영향력을 지워버립니다.
+        joint_features = joint_features * confidence
+        uv_normalized = uv_normalized * confidence
 
-        # Feature refinement
-        refined = self.joint_feature_net(joint_features)  # (B, NJ, 256)
+        # Concatenate & Refine
+        joint_features = torch.cat([joint_features, uv_normalized], dim=-1)
+        refined_joints = self.joint_feature_net(joint_features)  # (B, NJ, 256)
 
-        # Add joint identity embedding: "이 토큰은 1번 모터(Base)입니다" / "이 토큰은 7번 모터(Wrist)입니다"
-        # Without this, the transformer must infer joint identity from visual features alone!
+        # 🚀 [NEW] 4. 글로벌 뷰 토큰 (Global Token) 생성
+        # DINOv3 피처맵 전체를 평균 내어 전역 문맥 토큰을 만듭니다.
+        global_pool = F.adaptive_avg_pool2d(feat_map, 1).flatten(1) # (B, D)
+        global_token = self.global_feature_net(global_pool).unsqueeze(1) # (B, 1, 256)
+
+        # 글로벌 토큰을 관절 토큰 배열의 맨 앞에 붙임 (B, NJ+1, 256)
+        combined_tokens = torch.cat([global_token, refined_joints], dim=1)
+
+        # 5. Joint Identity Embedding 추가
         if self.use_joint_embedding:
-            joint_ids = torch.arange(self.num_joints, device=dino_features.device).expand(b, self.num_joints)
-            joint_embeds = self.joint_embedding(joint_ids)  # (B, NJ, 256)
-            refined = refined + joint_embeds  # 시각+공간 특징에 이름표를 더함!
+            # 0번은 Global Token용, 1~7번은 관절용 이름표
+            token_ids = torch.arange(self.num_joints + 1, device=dino_features.device).expand(b, self.num_joints + 1)
+            token_embeds = self.joint_embedding(token_ids)
+            combined_tokens = combined_tokens + token_embeds
 
-        # Self-attention for kinematic constraint learning
-        related = self.joint_relation_net(refined)  # (B, NJ, 256)
+        # 6. Transformer Self-attention 통과
+        related_tokens = self.joint_relation_net(combined_tokens)  # (B, NJ+1, 256)
 
-        # Global decoding from integrated robot state.
-        global_state = related.mean(dim=1)  # (B, 256)
-        raw_global = self.global_angle_predictor(global_state)  # (B, num_angles)
+        # 7. Decoding
+        # 글로벌 예측은 맨 앞의 Global Token(0번째 인덱스) 결과를 사용
+        global_state = related_tokens[:, 0, :]  # (B, 256)
+        raw_global = self.global_angle_predictor(global_state)
 
-        # Per-joint residual correction (context-aware due to self-attention).
-        raw_residual = self.per_joint_residual_head(related).squeeze(-1)  # (B, NJ)
-        raw_residual = self.residual_mixer(raw_residual)  # (B, num_angles)
-        residual_scale = torch.sigmoid(self.residual_scale)  # (0, 1)
+        # 잔차(Residual) 보정은 뒤에 있는 관절 토큰(1~7번 인덱스) 결과를 사용
+        joint_states = related_tokens[:, 1:, :] # (B, NJ, 256)
+        raw_residual = self.per_joint_residual_head(joint_states).squeeze(-1)
+        raw_residual = self.residual_mixer(raw_residual)
+
+        residual_scale = torch.sigmoid(self.residual_scale)
         raw_angles = raw_global + residual_scale * torch.tanh(raw_residual)
 
-        # Apply joint limits via tanh scaling: mid + tanh(raw) * range
         joint_angles = self.joint_mid.unsqueeze(0) + torch.tanh(raw_angles) * self.joint_range.unsqueeze(0)
 
-        # Forward kinematics always expects 7-DoF Panda vector.
-        # In 6-DoF mode we append fixed joint7=0.
+        # Forward Kinematics 처리 (기존과 동일)
         if self.num_angles < 7:
             pad = torch.zeros((joint_angles.shape[0], 7 - self.num_angles), device=joint_angles.device, dtype=joint_angles.dtype)
             joint_angles_fk = torch.cat([joint_angles, pad], dim=1)
         else:
             joint_angles_fk = joint_angles
-        keypoints_3d_robot = panda_forward_kinematics(joint_angles_fk)  # (B, 7, 3)
+        keypoints_3d_robot = panda_forward_kinematics(joint_angles_fk)
 
         return joint_angles, keypoints_3d_robot
-
-
-class EnhancedKeypoint3DHead(nn.Module):
-    """
-    Predicts 3D coordinates by combining DINO features with explicit joint identity embeddings.
-    """
-
-    def __init__(self, input_dim=FEATURE_DIM, num_joints=NUM_JOINTS, use_joint_embedding=True):
-        super().__init__()
-        self.num_joints = num_joints
-        self.hidden_dim = 512
-        self.use_joint_embedding = use_joint_embedding
-
-        # 1) Per-joint feature refinement
-        self.joint_feature_net = nn.Sequential(
-            nn.Linear(input_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(self.hidden_dim)
-        )
-
-        # 2) Joint identity embedding ("name tag" for each joint token)
-        if use_joint_embedding:
-            self.joint_embedding = nn.Embedding(num_joints, self.hidden_dim)
-
-        # 3) Self-attention over joint tokens to learn inter-joint constraints
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.hidden_dim,
-            nhead=8,
-            dim_feedforward=2048,
-            dropout=0.1,
-            activation='gelu',
-            batch_first=True
-        )
-        self.joint_relation_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
-
-        # 4) Regress xyz per joint
-        self.coord_predictor = nn.Sequential(
-            nn.Linear(self.hidden_dim, 128),
-            nn.GELU(),
-            nn.LayerNorm(128),
-            nn.Linear(128, 3)
-        )
-
-    def forward(self, dino_features, predicted_heatmaps):
-        b, n, d = dino_features.shape
-        h = w = int(math.sqrt(n))
-        feat_map = dino_features.permute(0, 2, 1).reshape(b, d, h, w)  # (B, D, h, w)
-
-        # Spatial softmax pooling using heatmaps as attention over feature map
-        weights = F.interpolate(predicted_heatmaps, size=(h, w), mode='bilinear', align_corners=False)
-        weights = torch.clamp(weights, min=0.0)
-        weights_flat = weights.reshape(b, self.num_joints, -1)
-        weights_norm = F.softmax(weights_flat / 0.1, dim=-1).reshape(b, self.num_joints, h, w)
-
-        # Weighted per-joint visual tokens: (B, NJ, D)
-        joint_features = torch.einsum('bdhw,bjhw->bjd', feat_map, weights_norm)
-
-        refined_features = self.joint_feature_net(joint_features)  # (B, NJ, 256)
-
-        if self.use_joint_embedding:
-            joint_ids = torch.arange(self.num_joints, device=dino_features.device).unsqueeze(0).expand(b, self.num_joints)
-            joint_embeds = self.joint_embedding(joint_ids)  # (B, NJ, 256)
-            fused_features = refined_features + joint_embeds
-        else:
-            fused_features = refined_features
-
-        related_features = self.joint_relation_net(fused_features)  # (B, NJ, 256)
-        pred_kpts_3d = self.coord_predictor(related_features)  # (B, NJ, 3)
-        return pred_kpts_3d
-
-
-class FusionCorrectionHead(nn.Module):
-    """
-    Fuse FK branch and direct 3D branch, then predict residual correction.
-    """
-
-    def __init__(self):
-        super().__init__()
-        # Input per joint: fk(3), direct(3), diff(3), confidence(1) = 10
-        self.fusion_mlp = nn.Sequential(
-            nn.Linear(10, 64),
-            nn.GELU(),
-            nn.LayerNorm(64),
-            nn.Linear(64, 64),
-            nn.GELU(),
-            nn.LayerNorm(64),
-            nn.Linear(64, 4),  # delta xyz (3) + alpha logit (1)
-        )
-
-    def forward(self, kp3d_fk, kp3d_direct, predicted_heatmaps):
-        hm_max = predicted_heatmaps.flatten(2).amax(dim=-1, keepdim=True)  # (B, NJ, 1)
-        confidence = torch.sigmoid(hm_max)
-
-        diff = kp3d_direct - kp3d_fk
-        fusion_input = torch.cat([kp3d_fk, kp3d_direct, diff, confidence], dim=-1)  # (B, NJ, 10)
-        fusion_out = self.fusion_mlp(fusion_input)  # (B, NJ, 4)
-
-        delta = fusion_out[:, :, :3]
-        alpha = torch.sigmoid(fusion_out[:, :, 3:4])  # (B, NJ, 1)
-        blended = alpha * kp3d_direct + (1.0 - alpha) * kp3d_fk
-        kp3d_final = blended + delta
-
-        return kp3d_final, alpha, delta
 
 
 def compute_extrinsics_from_pnp(kp3d_robot, kp2d_image, camera_K):
@@ -838,15 +785,7 @@ class DINOv3PoseEstimator(nn.Module):
             use_joint_embedding=use_joint_embedding
         )
 
-        # 3. Direct 3D regression branch
-        self.direct_3d_head = EnhancedKeypoint3DHead(
-            input_dim=feature_dim,
-            num_joints=NUM_JOINTS,
-            use_joint_embedding=use_joint_embedding,
-        )
-
-        # 4. Fusion + residual correction (FK branch + direct branch)
-        self.fusion_head = FusionCorrectionHead()
+        # Direct 3D branch and Fusion head removed — using FK output directly.
 
         # Iterative refinement module is disabled in simplified mode.
         self.refinement_module = None
@@ -883,22 +822,13 @@ class DINOv3PoseEstimator(nn.Module):
         # 4. Optional iterative refinement on angle/FK branch (disabled in simplified mode)
         result = {}
 
-        # 5. Direct 3D branch + fusion correction
-        kpts_3d_direct = self.direct_3d_head(dino_features, predicted_heatmaps)
-        kpts_3d_final, fusion_alpha, fusion_delta = self.fusion_head(
-            current_kp3d_fk, kpts_3d_direct, predicted_heatmaps
-        )
-
-        # Main outputs
+        # Main outputs (FK is the final 3D estimate)
         result.update({
             'heatmaps_2d': predicted_heatmaps,
             'joint_angles': current_angles,
             'keypoints_3d_fk': current_kp3d_fk,
-            'keypoints_3d_direct': kpts_3d_direct,
-            'fusion_alpha': fusion_alpha,
-            'fusion_delta': fusion_delta,
-            'keypoints_3d': kpts_3d_final,          # final 3D estimate (robot frame)
-            'keypoints_3d_robot': kpts_3d_final,    # keep compatibility with existing losses/eval
+            'keypoints_3d': current_kp3d_fk,
+            'keypoints_3d_robot': current_kp3d_fk,
         })
 
         return result
