@@ -4,10 +4,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Model checkpoint
+<<<<<<< HEAD
 MODEL_PATH="/home/najo/NAS/DIP/DINObotPose3/TRAIN/outputs/dinov3_base_20260303_170451_no/best_model.pth"
 
 # Input annotation JSON (contains image path + GT keypoints + camera K)
 JSON_PATH="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_test_dr/000001.json"
+=======
+MODEL_PATH="/data/public/NAS/DINObotPose3/TRAIN/outputs/dinov3_base_20260303_020716/epoch_56.pth"
+
+# Input annotation JSON (contains image path + GT keypoints + camera K)
+JSON_PATH="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-orb/031945.json"
+>>>>>>> 4e41e1250ca28b42d13188b35a1f3cab6fbf58ea
 
 # Output directory
 OUTPUT_DIR="${SCRIPT_DIR}/real_inference_output"
@@ -18,12 +25,20 @@ ROBOPEPP_FIX_JOINT7_ZERO=1
 PNP_MODE="epnp"  # epnp (baseline) | loo_epnp (alternative) | ransac
 PNP_TOPK=6
 PNP_RANSAC_REPROJ_ERROR=5.0
+<<<<<<< HEAD
 KP_MIN_CONFIDENCE=0.001  # mask low-confidence 2D keypoints as invalid (-999)
 KP_MIN_PEAK_LOGIT=0.001  # mask low-peak heatmap keypoints as invalid (-999)
+=======
+KP_MIN_CONFIDENCE=0.25  # mask low-confidence 2D keypoints as invalid (-999)
+KP_MIN_PEAK_LOGIT=0.25  # mask low-peak heatmap keypoints as invalid (-999)
+>>>>>>> 4e41e1250ca28b42d13188b35a1f3cab6fbf58ea
 PNP_REPROJ_OUTLIER_THRESH=12.0  # reject high-reprojection-error points and refit
-PNP_MIN_SPAN_PX=20.0  # reject PnP if selected points are too concentrated
+PNP_MIN_SPAN_PX=5.0  # reject PnP if selected points are too concentrated
 PNP_MIN_AREA_RATIO=0.001
 FILL_INVALID_2D_WITH_FK_REPROJ=1  # fill low-reliability 2D with FK reprojection after successful PnP
+PNP_Z_SEARCH_MIN_M=-0.05
+PNP_Z_SEARCH_MAX_M=0.05
+PNP_Z_SEARCH_STEP_M=0.001
 
 echo "=========================================="
 echo "  Real Image Inference (GT vs Prediction)"
@@ -36,6 +51,7 @@ echo "  Keypoint min confidence: ${KP_MIN_CONFIDENCE}"
 echo "  Keypoint min peak logit: ${KP_MIN_PEAK_LOGIT}"
 echo "  PnP reproj outlier threshold: ${PNP_REPROJ_OUTLIER_THRESH}px"
 echo "  PnP min span: ${PNP_MIN_SPAN_PX}px, min area ratio: ${PNP_MIN_AREA_RATIO}"
+echo "  PnP Z-search: [${PNP_Z_SEARCH_MIN_M}, ${PNP_Z_SEARCH_MAX_M}] m step ${PNP_Z_SEARCH_STEP_M} m"
 echo "  RoboPEPP joint7=0: ${ROBOPEPP_FIX_JOINT7_ZERO}"
 echo ""
 
@@ -56,6 +72,9 @@ python "${SCRIPT_DIR}/inference_with_real.py" \
     --pnp-reproj-outlier-thresh "${PNP_REPROJ_OUTLIER_THRESH}" \
     --pnp-min-span-px "${PNP_MIN_SPAN_PX}" \
     --pnp-min-area-ratio "${PNP_MIN_AREA_RATIO}" \
+    --pnp-z-search-min-m "${PNP_Z_SEARCH_MIN_M}" \
+    --pnp-z-search-max-m "${PNP_Z_SEARCH_MAX_M}" \
+    --pnp-z-search-step-m "${PNP_Z_SEARCH_STEP_M}" \
     --kp-min-peak-logit "${KP_MIN_PEAK_LOGIT}" \
     --kp-min-confidence "${KP_MIN_CONFIDENCE}" \
     $( [[ "${FILL_INVALID_2D_WITH_FK_REPROJ}" == "1" ]] && echo "--fill-invalid-2d-with-fk-reproj" )
