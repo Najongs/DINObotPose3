@@ -138,8 +138,13 @@ class JointAnglePoseLoss(nn.Module):
             pred_sin = pred_sc[:, 1::2]
 
             # GT sin/cos from angles
-            gt_cos = torch.cos(gt_angles)
-            gt_sin = torch.sin(gt_angles)
+            gt_angles_sc = gt_angles.clone()
+            if self.fix_joint7 and gt_angles_sc.shape[1] >= 7:
+                # 🚀 Fix joint 7 (index 6) to 0 for consistency
+                gt_angles_sc[:, 6] = 0.0
+
+            gt_cos = torch.cos(gt_angles_sc)
+            gt_sin = torch.sin(gt_angles_sc)
 
             # 🚀 SmoothL1Loss on sin/cos (더 안정적)
             sc_loss = self.loss_fn(pred_cos, gt_cos) + self.loss_fn(pred_sin, gt_sin)
@@ -431,13 +436,30 @@ def main(args):
                 with torch.no_grad():
                     pred_angles = preds['joint_angles']  # (B, num_angles)
                     gt_angles = gt_dict['angles']  # (B, num_angles)
+
+                    # 🚀 Apply fix_joint7 to GT for consistency with pred_angles
+                    if args.fix_joint7:
+                        gt_angles = gt_angles.clone()
+                        gt_angles[:, 6] = 0.0
+
                     pred_kp_3d = preds['keypoints_3d_robot']  # (B, 7, 3)
                     gt_kp_3d = panda_forward_kinematics(gt_angles)  # (B, 7, 3)
 
                     # ==================== 관절 각도 에러 ====================
+                    # 방법 1: Angle space에서 계산 (wrap-aware)
                     angle_diff = pred_angles - gt_angles
                     angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
                     angle_error_deg = torch.abs(angle_diff) * 180.0 / math.pi
+
+                    # Debug: Raw angle 범위 출력 (첫 epoch에만)
+                    if is_main and epoch == 0 and i == 0:
+                        print(f"\n[DEBUG] Joint 0 angle analysis:")
+                        for j in [0, min(1, preds['joint_angles'].shape[1]-1)]:
+                            print(f"  Joint {j}:")
+                            print(f"    GT:   min={gt_angles[:, j].min():.4f}, max={gt_angles[:, j].max():.4f}, mean={gt_angles[:, j].mean():.4f}")
+                            print(f"    Pred: min={pred_angles[:, j].min():.4f}, max={pred_angles[:, j].max():.4f}, mean={pred_angles[:, j].mean():.4f}")
+                            print(f"    Error (deg): min={angle_error_deg[:, j].min():.2f}, max={angle_error_deg[:, j].max():.2f}")
+
                     mae_per_joint = angle_error_deg.mean(dim=0)
                     max_error_per_joint = angle_error_deg.max(dim=0)[0]
 
@@ -467,6 +489,24 @@ def main(args):
 
                     worst_joint = mae_per_joint.argmax()
                     print(f"  → Worst: Joint {worst_joint.item()} ({mae_per_joint[worst_joint].item():.2f}°)")
+
+                    # 🔴 SANITY CHECK: Sin/Cos loss와 Angle error 간 일관성 검증
+                    if 'pred_sin_cos' in preds and is_main:
+                        pred_sc = preds['pred_sin_cos']
+                        pred_cos_val = pred_sc[:, 0::2]
+                        pred_sin_val = pred_sc[:, 1::2]
+                        gt_cos_val = torch.cos(gt_angles)
+                        gt_sin_val = torch.sin(gt_angles)
+
+                        sc_diff = torch.sqrt((pred_cos_val - gt_cos_val)**2 + (pred_sin_val - gt_sin_val)**2)
+                        sc_mae_per_joint = sc_diff.mean(dim=0)
+
+                        print(f"\n{'='*60}")
+                        print(f"[SANITY CHECK] Sin/Cos space vs Angle space MAE")
+                        print("="*60)
+                        for j in range(len(mae_per_joint)):
+                            print(f"  Joint {j}: angle_mae={mae_per_joint[j].item():.2f}°, sc_mae={sc_mae_per_joint[j].item():.4f}")
+                        print("="*60)
 
                     print(f"\n{'='*60}")
                     print(f"3D POSE ERROR (mm)")

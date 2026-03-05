@@ -532,6 +532,10 @@ class DINOv3PoseEstimator(nn.Module):
                 joint_angles = joint_angles.clone()
                 joint_angles[:, 6] = 0.0
                 kpts_3d_robot = panda_forward_kinematics(joint_angles)
+                # 🚀 Also fix sin/cos representation for consistency with joint_angles
+                pred_sin_cos = pred_sin_cos.clone()
+                pred_sin_cos[:, 12] = 1.0  # cos(0) = 1.0 for joint 6
+                pred_sin_cos[:, 13] = 0.0  # sin(0) = 0.0 for joint 6
 
             result = {
                 'heatmaps_2d': predicted_heatmaps,
