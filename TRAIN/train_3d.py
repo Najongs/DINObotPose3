@@ -442,8 +442,17 @@ def main(args):
                         gt_angles = gt_angles.clone()
                         gt_angles[:, 6] = 0.0
 
-                    pred_kp_3d = preds['keypoints_3d_robot']  # (B, 7, 3)
-                    gt_kp_3d = panda_forward_kinematics(gt_angles)  # (B, 7, 3)
+                    # 🚀 Use camera-frame 3D (from PnP) for evaluation
+                    if 'keypoints_3d_cam' in preds:
+                        # Camera-frame 3D (PnP transformed)
+                        pred_kp_3d = preds['keypoints_3d_cam']  # (B, 7, 3) - camera frame
+                        gt_kp_3d = gt_dict['keypoints_3d']  # (B, 7, 3) - camera frame (from JSON)
+                        is_camera_frame = True
+                    else:
+                        # Fallback: robot-frame 3D (old behavior)
+                        pred_kp_3d = preds['keypoints_3d_robot']  # (B, 7, 3)
+                        gt_kp_3d = panda_forward_kinematics(gt_angles)  # (B, 7, 3)
+                        is_camera_frame = False
 
                     # ==================== 관절 각도 에러 ====================
                     # 방법 1: Angle space에서 계산 (wrap-aware)
@@ -464,6 +473,7 @@ def main(args):
                     max_error_per_joint = angle_error_deg.max(dim=0)[0]
 
                     # ==================== 3D 복원 오차 ====================
+                    # Primary: camera-frame 또는 robot-frame (선택된 frame)
                     kp_error_mm = torch.norm(pred_kp_3d - gt_kp_3d, dim=2) * 1000  # m → mm
                     mae_3d_per_joint = kp_error_mm.mean(dim=0)  # (7,)
                     max_3d_per_joint = kp_error_mm.max(dim=0)[0]
@@ -471,6 +481,19 @@ def main(args):
                     # 전체 3D 오차
                     mean_3d_error = kp_error_mm.mean().item()
                     median_3d_error = torch.median(kp_error_mm.flatten()).item()
+
+                    # Auxiliary: robot-frame 메트릭 (비교용)
+                    if is_camera_frame:
+                        kp_error_mm_robot = torch.norm(pred_kp_3d_robot - gt_kp_3d_robot, dim=2) * 1000
+                        mae_3d_per_joint_robot = kp_error_mm_robot.mean(dim=0)
+                        max_3d_per_joint_robot = kp_error_mm_robot.max(dim=0)[0]
+                        mean_3d_error_robot = kp_error_mm_robot.mean().item()
+                        median_3d_error_robot = torch.median(kp_error_mm_robot.flatten()).item()
+                        add_errors_robot = kp_error_mm_robot.flatten()
+                        add_auc_robot = (add_errors_robot < d_threshold).float().mean().item()
+                    else:
+                        mae_3d_per_joint_robot = None
+                        mean_3d_error_robot = None
 
                     # ==================== ADD AUC (6D Pose Metric) ====================
                     # ADD: Average Distance of model Dpoints
@@ -509,7 +532,8 @@ def main(args):
                         print("="*60)
 
                     print(f"\n{'='*60}")
-                    print(f"3D POSE ERROR (mm)")
+                    coord_frame_label = "3D POSE ERROR - CAMERA FRAME (mm)" if is_camera_frame else "3D POSE ERROR - ROBOT FRAME (mm)"
+                    print(coord_frame_label)
                     print("="*60)
                     for j in range(len(mae_3d_per_joint)):
                         print(f"  Joint {j}: MAE={mae_3d_per_joint[j].item():.2f}mm, Max={max_3d_per_joint[j].item():.2f}mm")
@@ -517,6 +541,14 @@ def main(args):
                     worst_3d_joint = mae_3d_per_joint.argmax()
                     print(f"  → Worst: Joint {worst_3d_joint.item()} ({mae_3d_per_joint[worst_3d_joint].item():.2f}mm)")
                     print(f"  → Overall Mean: {mean_3d_error:.2f}mm, Median: {median_3d_error:.2f}mm")
+
+                    # Robot-frame 메트릭도 출력 (비교용)
+                    if is_camera_frame and mae_3d_per_joint_robot is not None:
+                        print(f"\n{'='*60}")
+                        print(f"3D POSE ERROR - ROBOT FRAME (mm) [FOR COMPARISON]")
+                        print("="*60)
+                        print(f"  Overall Mean: {mean_3d_error_robot:.2f}mm, Median: {median_3d_error_robot:.2f}mm")
+                        print(f"  ADD AUC@{d_threshold}mm: {add_auc_robot*100:.2f}%")
 
                     print(f"\n{'='*60}")
                     print(f"ADD AUC (threshold={d_threshold}mm)")
@@ -542,9 +574,19 @@ def main(args):
                             wandb_logs[f"val/joint_{j}_3d_max_mm"] = max_3d_per_joint[j].item()
 
                         # 전체 3D 메트릭
-                        wandb_logs["val/3d_mean_error_mm"] = mean_3d_error
-                        wandb_logs["val/3d_median_error_mm"] = median_3d_error
-                        wandb_logs["val/add_auc"] = add_auc
+                        frame_suffix = "_cam" if is_camera_frame else "_robot"
+                        wandb_logs[f"val/3d_mean_error_mm{frame_suffix}"] = mean_3d_error
+                        wandb_logs[f"val/3d_median_error_mm{frame_suffix}"] = median_3d_error
+                        wandb_logs[f"val/add_auc{frame_suffix}"] = add_auc
+
+                        # Robot-frame 메트릭도 로깅 (비교용)
+                        if is_camera_frame and mae_3d_per_joint_robot is not None:
+                            wandb_logs["val/3d_mean_error_mm_robot"] = mean_3d_error_robot
+                            wandb_logs["val/3d_median_error_mm_robot"] = median_3d_error_robot
+                            wandb_logs["val/add_auc_robot"] = add_auc_robot
+
+                        # 좌표계 정보 기록
+                        wandb_logs["val/using_camera_frame_3d"] = float(is_camera_frame)
 
                         wandb.log(wandb_logs)
             log_dict = {"val/loss": avg_val_loss, "epoch": epoch}
