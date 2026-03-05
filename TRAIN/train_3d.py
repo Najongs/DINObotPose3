@@ -485,13 +485,13 @@ def main(args):
                     # 🚀 [개선] valid_mask 적용
                     valid_mask = gt_dict.get('valid_mask', torch.ones(angle_error_deg.shape[0], dtype=torch.bool, device=device))
 
-                    # Only compute metrics for valid joints
+                    # Only compute metrics for valid samples
                     if valid_mask.any():
-                        # Expand valid_mask for broadcasting: (B,) → (B, 1)
-                        valid_mask_expanded = valid_mask.unsqueeze(1)  # (B, 1)
-                        angle_error_deg_masked = angle_error_deg.clone()
-                        angle_error_deg_masked[~valid_mask_expanded] = 0.0  # Mask invalid
+                        # Mask invalid samples using multiplication: (B,) → (B, 1)
+                        valid_mask_float = valid_mask.float().unsqueeze(1)  # (B, 1)
+                        angle_error_deg_masked = angle_error_deg * valid_mask_float  # Element-wise multiply
 
+                        # Average only over valid samples
                         mae_per_joint = (angle_error_deg_masked.sum(dim=0) / valid_mask.float().sum()).clamp(min=0)
                         max_error_per_joint = angle_error_deg.max(dim=0)[0]
                     else:
@@ -504,13 +504,15 @@ def main(args):
 
                     # 🚀 [개선] valid_mask 적용 (3D에도)
                     if valid_mask.any():
-                        kp_error_mm_masked = kp_error_mm.clone()
-                        valid_mask_expanded_2d = valid_mask.unsqueeze(1)  # (B, 1)
-                        kp_error_mm_masked[~valid_mask_expanded_2d] = 0.0
+                        # Mask invalid samples
+                        valid_mask_float_2d = valid_mask.float().unsqueeze(1)  # (B, 1)
+                        kp_error_mm_masked = kp_error_mm * valid_mask_float_2d  # Element-wise multiply
 
+                        # Average only over valid samples
                         mae_3d_per_joint = (kp_error_mm_masked.sum(dim=0) / valid_mask.float().sum()).clamp(min=0)
                         max_3d_per_joint = kp_error_mm.max(dim=0)[0]
 
+                        # Collect valid errors for median and other stats
                         valid_errors = kp_error_mm[valid_mask]
                         mean_3d_error = valid_errors.mean().item()
                         median_3d_error = torch.median(valid_errors).item()
@@ -526,8 +528,7 @@ def main(args):
 
                         # 🚀 [개선] valid_mask 적용 (robot-frame도)
                         if valid_mask.any():
-                            kp_error_mm_robot_masked = kp_error_mm_robot.clone()
-                            kp_error_mm_robot_masked[~valid_mask_expanded_2d] = 0.0
+                            kp_error_mm_robot_masked = kp_error_mm_robot * valid_mask_float_2d  # Element-wise multiply
                             mae_3d_per_joint_robot = (kp_error_mm_robot_masked.sum(dim=0) / valid_mask.float().sum()).clamp(min=0)
                             valid_errors_robot = kp_error_mm_robot[valid_mask]
                             mean_3d_error_robot = valid_errors_robot.mean().item()
