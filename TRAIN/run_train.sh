@@ -8,19 +8,14 @@
 # =============================================================================
 
 # Data paths (REQUIRED - Update these paths!)
-<<<<<<< HEAD
-DATA_DIRS=("/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_test_dr")
-VAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"  
-=======
-DATA_DIRS=("/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM" "/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn")
-VAL_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/TOTAL/DREAM_to_DREAM/panda-3cam_azure"  
->>>>>>> 4e41e1250ca28b42d13188b35a1f3cab6fbf58ea
+DATA_DIRS=("/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr")
+VAL_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"  
 
 # DATA_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"  # Training data directory
 # VAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"  # Validation data directory (separate from training)
 
 TRAIN_SPLIT=1.0  # Train split ratio (1.0 = use all training data when VAL_DIR is specified)
-VAL_SPLIT=0.2  # Validation data usage ratio (0.1 = use 10% of validation data)
+VAL_SPLIT=0.5  # Validation data usage ratio (0.1 = use 10% of validation data)
 TRAIN_JSON_LIST=""  # e.g. /data/public/NAS/DINObotPose2/Eval/eval_outputs_outlier/outlier_topk_json_paths.txt
 TRAIN_JSON_LIST_MODE="extra"  # extra: full train + json-list extra pass per epoch, filter: only json list
 TRAIN_JSON_EXTRA_LOSS_SCALE=1.0
@@ -39,8 +34,8 @@ FIX_JOINT7_ZERO=True      # RoboPEPP-style: train with joint7 fixed to zero
 # angle loss: 라디안 단위 (범위 ~0~6), 3D loss: 미터 단위 (범위 ~0.01~0.5)
 # FK_3D는 robot frame 기준이므로 실제 성능 지표(camera frame ADD)와 좌표계가 다름
 # → angle loss로 자세 추정 → FK_3D로 구조적 일관성 강제 순서로 학습
-ANGLE_WEIGHT=10.0    # Joint angle MSE loss weight
-FK_3D_WEIGHT=100.0   # FK 3D keypoint MSE loss weight (robot frame)
+ANGLE_WEIGHT=1.0    # Joint angle MSE loss weight
+FK_3D_WEIGHT=1.0   # FK 3D keypoint MSE loss weight (robot frame)
 DIRECT_3D_WEIGHT=0.0  # FK-only: direct 3D branch supervision disabled
 CONSISTENCY_WEIGHT=0.0  # FK-only: FK/direct consistency disabled
 FUSION_DELTA_WEIGHT=0.0  # FK-only: fusion residual regularization disabled
@@ -52,29 +47,21 @@ REFINEMENT_ITERATIONS=3        # Number of refinement iterations
 REFINEMENT_WEIGHT=50.0         # Refinement loss weight
 
 # Loss weights
-HEATMAP_WEIGHT=1000.0
-KP3D_WEIGHT=100.0
+HEATMAP_WEIGHT=1.0
+KP3D_WEIGHT=1.0
 HEATMAP_ONLY_TRAIN=False  # True: train only 2D heatmap branch
 
 # FDA (Fourier Domain Adaptation) for sim-to-real
-<<<<<<< HEAD
-FDA_REAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"  # Real images (no labels needed)
-=======
 FDA_REAL_DIR="/data/public/NAS/DINObotPose2/Dataset/DREAM_real"  # Real images (no labels needed)
->>>>>>> 4e41e1250ca28b42d13188b35a1f3cab6fbf58ea
-# FDA_REAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_real"
-FDA_BETA=0.05   # Low-freq replacement ratio (0.01=subtle tone shift, 0.05=strong)
-FDA_PROB=0.5   # Probability of applying FDA per sample (0.0 to disable)
+FDA_BETA=0.001
+FDA_PROB=0.0
+
 OCCLUSION_PROB=0.0          # CoarseDropout probability for occlusion robustness
-OCCLUSION_MAX_HOLES=3       # Maximum occlusion patches per image
+OCCLUSION_MAX_HOLES=0
 OCCLUSION_MAX_SIZE_FRAC=0.2 # Max patch size ratio (image side fraction)
 
 # Training hyperparameters
-<<<<<<< HEAD
 EPOCHS=30
-=======
-EPOCHS=100
->>>>>>> 4e41e1250ca28b42d13188b35a1f3cab6fbf58ea
 BATCH_SIZE=16
 NUM_WORKERS=4
 OPTIMIZER="adam"  # Options: adam, adamw, sgd
@@ -101,17 +88,10 @@ WANDB_RUN_NAME="dinov3_base_$(date +%Y%m%d_%H%M%S)"
 
 # Other settings
 SEED=42
-<<<<<<< HEAD
 RESUME=""  # Path to checkpoint for resuming (leave empty for new training)
 RESUME_LR=""  # Learning rate to use when resuming (leave empty for automatic calculation from scheduler)
-LOAD_2D_HEAD=""  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
-FREEZE_2D_HEAD_EPOCHS=30  # If LOAD_2D_HEAD is set, freeze loaded 2D head for first N epochs then unfreeze
-=======
-RESUME="/data/public/NAS/DINObotPose3/TRAIN/outputs/dinov3_base_20260303_020716/epoch_56.pth"  # Path to checkpoint for resuming (leave empty for new training)
-RESUME_LR=""  # Learning rate to use when resuming (leave empty for automatic calculation from scheduler)
-LOAD_2D_HEAD=""  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
-FREEZE_2D_HEAD_EPOCHS=100  # If LOAD_2D_HEAD is set, freeze loaded 2D head for first N epochs then unfreeze
->>>>>>> 4e41e1250ca28b42d13188b35a1f3cab6fbf58ea
+LOAD_2D_HEAD="/data/public/NAS/DINObotPose3/TRAIN/outputs_heatmap/finetune_beta_0.001_beta0.001_20260304_165926/best_heatmap.pth"  # Path to checkpoint for loading pretrained 2D heatmap head (leave empty to train from scratch)
+FREEZE_2D_HEAD_EPOCHS=10  # If LOAD_2D_HEAD is set, freeze loaded 2D head for first N epochs then unfreeze
 
 # =============================================================================
 # Training Modes
@@ -191,10 +171,8 @@ COMMON_ARGS="\
     ${HEATMAP_ONLY_FLAG} \
     --angle-weight ${ANGLE_WEIGHT} \
     --fk-3d-weight ${FK_3D_WEIGHT} \
-    --direct-3d-weight ${DIRECT_3D_WEIGHT} \
     --consistency-weight ${CONSISTENCY_WEIGHT} \
     --fusion-delta-weight ${FUSION_DELTA_WEIGHT} \
-    $([ -n "${KEYPOINT_3D_WEIGHTS}" ] && echo "--keypoint-3d-weights ${KEYPOINT_3D_WEIGHTS}") \
     ${REFINEMENT_FLAG} \
     --batch-size ${BATCH_SIZE} \
     --num-workers ${NUM_WORKERS} \

@@ -132,13 +132,33 @@ def main(args):
     if args.checkpoint and os.path.isfile(args.checkpoint):
         if is_main:
             print(f"==> Loading weights from checkpoint: {args.checkpoint}")
+        
         checkpoint = torch.load(args.checkpoint, map_location=device)
-        # 만약 체크포인트가 DDP 모델 저장 파일이면 'module.' 접두사가 있을 수 있음
-        model.load_state_dict(checkpoint)
+        
+        # 현재 모델의 파라미터 상태 가져오기
+        model_state_dict = model.state_dict()
+        
+        # 'module.' 접두사 제거 (만약 DDP로 저장된 체크포인트인 경우)
+        checkpoint_dict = {k.replace('module.', ''): v for k, v in checkpoint.items()}
+        
+        # 🚀 [핵심] 가중치 필터링: 현재 모델에 해당 키가 존재하고, 텐서 모양(shape)이 완벽히 똑같은 경우만 복사!
+        filtered_dict = {
+            k: v for k, v in checkpoint_dict.items() 
+            if k in model_state_dict and v.shape == model_state_dict[k].shape
+        }
+        
+        if is_main:
+            print(f"==> Successfully matched {len(filtered_dict)} out of {len(model_state_dict)} layers.")
+            missed_keys = set(model_state_dict.keys()) - set(filtered_dict.keys())
+            if missed_keys:
+                print(f"==> Randomly initializing {len(missed_keys)} new or modified layers (e.g., Large Kernels, FiLM).")
+        
+        # strict=False로 설정하여 누락된 키가 있어도 에러 없이 넘어가게 로드
+        model.load_state_dict(filtered_dict, strict=False)
     
     if local_rank != -1: model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
     
-    joint_weights = torch.tensor([1.5, 1.2, 1.0, 1.0, 1.0, 1.5, 2.0]).to(device)
+    joint_weights = torch.tensor([1.2, 1.1, 1.0, 1.0, 1.1, 1.2, 1.2]).to(device)
     criterion = nn.MSELoss(reduction='none')
     loss_scale = 1000.0
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate, weight_decay=args.weight_decay)

@@ -8,14 +8,14 @@
 # =============================================================================
 
 # GPU Settings
-GPU_IDS="0,1,2,3,4"
-NUM_GPUS=5
+GPU_IDS="0,1,2"
+NUM_GPUS=3
 export CUDA_VISIBLE_DEVICES=${GPU_IDS}
 
 # Common Data paths
-DATA_DIRS=("/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_syn/panda_synth_test_dr")
-VAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"
-FDA_REAL_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_real/panda-3cam_azure"
+DATA_DIRS=("/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr")
+VAL_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"
+FDA_REAL_DIR="/data/public/NAS/DINObotPose2/Dataset/DREAM_real"
 
 # Model configuration
 MODEL_NAME='facebook/dinov3-vitb16-pretrain-lvd1689m'
@@ -24,8 +24,8 @@ HEATMAP_SIZE=512
 UNFREEZE_BLOCKS=2
 
 # Training hyperparameters (Base)
-EPOCHS=50
-BATCH_SIZE=16
+EPOCHS=100
+BATCH_SIZE=32
 NUM_WORKERS=4
 LEARNING_RATE=1e-4
 MIN_LR=1e-10
@@ -68,7 +68,7 @@ run_finetune() {
         --min-lr ${MIN_LR} \
         --weight-decay ${WEIGHT_DECAY} \
         --fda-real-dir ${FDA_REAL_DIR} \
-        --fda-prob 0.5 \
+        --fda-prob 0.25 \
         --fda-beta ${FDA_BETA} \
         --wandb-project ${WANDB_PROJECT} \
         --wandb-run-name "${CURRENT_RUN_NAME}" \
@@ -83,13 +83,13 @@ run_finetune() {
 # =============================================================================
 
 # 1. FDA BETA 0.0 모델 추가 학습
-run_finetune "" "0.0" "no_fda"
+# run_finetune "" "0.0" "no_fda"
 
 # 2. FDA BETA 0.01 모델 추가 학습
-# run_finetune "" "0.01" "beta_0.01"
+# run_finetune "/home/najo/NAS/DIP/DINObotPose3/TRAIN/outputs_heatmap/finetune_beta_0.01_beta0.01_20260304_025505/best_heatmap.pth" "0.01" "beta_0.01"
 
 # 3. FDA BETA 0.001 모델 추가 학습
-run_finetune "" "0.001" "beta_0.001"
+run_finetune "/data/public/NAS/DINObotPose3/TRAIN/outputs_heatmap/finetune_beta_0.001_beta0.001_20260304_163045/best_heatmap.pth" "0.001" "beta_0.001"
 
 # 4. FDA BETA 0.05 모델 추가 학습
 # run_finetune "/home/najo/NAS/DIP/DINObotPose3/TRAIN/outputs_heatmap/finetune_beta_0.05_beta0.05_20260304_052019/best_heatmap.pth" "0.05" "beta_0.05"

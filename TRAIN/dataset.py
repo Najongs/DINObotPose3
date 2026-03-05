@@ -189,26 +189,34 @@ class PoseEstimationDataset(Dataset):
 
         # 데이터 증강 설정
         if self.augment:
-            # Occlusion robustness: hide random regions while keeping keypoint supervision.
+            # 🚀 [적당한 수준] Sim-to-Real 일반화 + 수렴 우선
             occ_max_frac = max(0.05, min(0.6, float(self.occlusion_max_size_frac)))
             occ_min_frac = min(0.04, occ_max_frac)
             self.augmentation = albu.Compose([
+                # 1. 적당한 노이즈
                 albu.GaussNoise(p=0.3),
-                albu.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+
+                # 2. 적당한 색상 변화
+                albu.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.4),
+                albu.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=20, val_shift_limit=15, p=0.3),
+
+                # 3. Occlusion (적당한 수준)
                 albu.CoarseDropout(
-                    num_holes_range=(1, self.occlusion_max_holes),
-                    hole_height_range=(occ_min_frac, occ_max_frac),
-                    hole_width_range=(occ_min_frac, occ_max_frac),
+                    num_holes_range=(1, max(3, self.occlusion_max_holes)),
+                    hole_height_range=(0.08, 0.3),
+                    hole_width_range=(0.08, 0.3),
                     fill=0,
-                    p=self.occlusion_prob,
+                    p=0.4,
                 ),
+
+                # 4. 기하학적 변환 (제한적)
                 albu.ShiftScaleRotate(
                     shift_limit=0.1,
                     scale_limit=0.1,
-                    rotate_limit=15,
-                    p=0.5
+                    rotate_limit=10,
+                    p=0.3
                 ),
-                albu.HueSaturationValue(p=0.3),
+
             ], keypoint_params=albu.KeypointParams(format='xy', remove_invisible=False))
 
     @staticmethod
@@ -578,14 +586,18 @@ class PoseEstimationDataset(Dataset):
         # Get robot type from sample info
         robot_type = sample_info.get('robot_type', 0)  # Default to franka_panda if not found
 
-        # Camera intrinsic matrix
-        camera_K = torch.from_numpy(keypoints_data['camera_K']).float()  # (3, 3)
+        # Camera intrinsic matrix (original resolution, will be scaled in train_3d.py)
+        camera_K = torch.from_numpy(keypoints_data['camera_K']).float()  # (3, 3) - original resolution
+
+        # 🚀 [NEW] Extract depths from 3D keypoints (Z-coordinate in camera frame)
+        depths = keypoints_3d_tensor[:, 2]  # (num_joints,) - Z values in meters
 
         sample = {
             'image': image_tensor,
             'heatmaps': heatmaps_tensor,
             'keypoints': keypoints_tensor,
             'keypoints_3d': keypoints_3d_tensor,
+            'depths': depths,  # 🚀 [NEW] Depth ground truth
             'valid_mask': valid_mask,
             'robot_type': torch.tensor(robot_type, dtype=torch.long),
             'name': sample_info['name'],
