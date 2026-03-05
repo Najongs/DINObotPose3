@@ -137,6 +137,12 @@ class JointAnglePoseLoss(nn.Module):
             pred_cos = pred_sc[:, 0::2]  # (B, n_angle)
             pred_sin = pred_sc[:, 1::2]
 
+            # 🚀 [개선] Sin/Cos 정규화 (unit circle 강제)
+            # Reshape to (B, n_angle, 2) for normalization
+            pred_sc_norm = torch.sqrt(pred_cos**2 + pred_sin**2).clamp(min=1e-8)
+            pred_cos_norm = pred_cos / pred_sc_norm
+            pred_sin_norm = pred_sin / pred_sc_norm
+
             # GT sin/cos from angles
             gt_angles_sc = gt_angles.clone()
             if self.fix_joint7 and gt_angles_sc.shape[1] >= 7:
@@ -146,10 +152,17 @@ class JointAnglePoseLoss(nn.Module):
             gt_cos = torch.cos(gt_angles_sc)
             gt_sin = torch.sin(gt_angles_sc)
 
-            # 🚀 SmoothL1Loss on sin/cos (더 안정적)
-            sc_loss = self.loss_fn(pred_cos, gt_cos) + self.loss_fn(pred_sin, gt_sin)
-            total_loss = total_loss + self.angle_weight * sc_loss
+            # 🚀 SmoothL1Loss on sin/cos (정규화된 pred 사용)
+            sc_loss = self.loss_fn(pred_cos_norm, gt_cos) + self.loss_fn(pred_sin_norm, gt_sin)
+
+            # 🚀 [신규] Norm penalty: ||[cos, sin]|| should be 1.0
+            # Encourage numerical stability on unit circle
+            norm_penalty = torch.mean((pred_sc_norm - 1.0)**2)
+
+            combined_sc_loss = sc_loss + 0.1 * norm_penalty
+            total_loss = total_loss + self.angle_weight * combined_sc_loss
             loss_dict['loss/sin_cos'] = sc_loss.item()
+            loss_dict['loss/norm_penalty'] = norm_penalty.item()
 
         # FK loss is disabled during training (use only for validation metric)
         if self.fk_3d_weight > 0 and 'keypoints_3d_fk' in pred_dict:
@@ -469,28 +482,62 @@ def main(args):
                             print(f"    Pred: min={pred_angles[:, j].min():.4f}, max={pred_angles[:, j].max():.4f}, mean={pred_angles[:, j].mean():.4f}")
                             print(f"    Error (deg): min={angle_error_deg[:, j].min():.2f}, max={angle_error_deg[:, j].max():.2f}")
 
-                    mae_per_joint = angle_error_deg.mean(dim=0)
-                    max_error_per_joint = angle_error_deg.max(dim=0)[0]
+                    # 🚀 [개선] valid_mask 적용
+                    valid_mask = gt_dict.get('valid_mask', torch.ones(angle_error_deg.shape[0], dtype=torch.bool, device=device))
+
+                    # Only compute metrics for valid joints
+                    if valid_mask.any():
+                        # Expand valid_mask for broadcasting: (B,) → (B, 1)
+                        valid_mask_expanded = valid_mask.unsqueeze(1)  # (B, 1)
+                        angle_error_deg_masked = angle_error_deg.clone()
+                        angle_error_deg_masked[~valid_mask_expanded] = 0.0  # Mask invalid
+
+                        mae_per_joint = (angle_error_deg_masked.sum(dim=0) / valid_mask.float().sum()).clamp(min=0)
+                        max_error_per_joint = angle_error_deg.max(dim=0)[0]
+                    else:
+                        mae_per_joint = torch.zeros_like(angle_error_deg[0])
+                        max_error_per_joint = torch.zeros_like(angle_error_deg[0])
 
                     # ==================== 3D 복원 오차 ====================
                     # Primary: camera-frame 또는 robot-frame (선택된 frame)
                     kp_error_mm = torch.norm(pred_kp_3d - gt_kp_3d, dim=2) * 1000  # m → mm
-                    mae_3d_per_joint = kp_error_mm.mean(dim=0)  # (7,)
-                    max_3d_per_joint = kp_error_mm.max(dim=0)[0]
 
-                    # 전체 3D 오차
-                    mean_3d_error = kp_error_mm.mean().item()
-                    median_3d_error = torch.median(kp_error_mm.flatten()).item()
+                    # 🚀 [개선] valid_mask 적용 (3D에도)
+                    if valid_mask.any():
+                        kp_error_mm_masked = kp_error_mm.clone()
+                        valid_mask_expanded_2d = valid_mask.unsqueeze(1)  # (B, 1)
+                        kp_error_mm_masked[~valid_mask_expanded_2d] = 0.0
+
+                        mae_3d_per_joint = (kp_error_mm_masked.sum(dim=0) / valid_mask.float().sum()).clamp(min=0)
+                        max_3d_per_joint = kp_error_mm.max(dim=0)[0]
+
+                        valid_errors = kp_error_mm[valid_mask]
+                        mean_3d_error = valid_errors.mean().item()
+                        median_3d_error = torch.median(valid_errors).item()
+                    else:
+                        mae_3d_per_joint = torch.zeros(7, device=device)
+                        max_3d_per_joint = torch.zeros(7, device=device)
+                        mean_3d_error = 0.0
+                        median_3d_error = 0.0
 
                     # Auxiliary: robot-frame 메트릭 (비교용)
                     if is_camera_frame:
                         kp_error_mm_robot = torch.norm(pred_kp_3d_robot - gt_kp_3d_robot, dim=2) * 1000
-                        mae_3d_per_joint_robot = kp_error_mm_robot.mean(dim=0)
-                        max_3d_per_joint_robot = kp_error_mm_robot.max(dim=0)[0]
-                        mean_3d_error_robot = kp_error_mm_robot.mean().item()
-                        median_3d_error_robot = torch.median(kp_error_mm_robot.flatten()).item()
-                        add_errors_robot = kp_error_mm_robot.flatten()
-                        add_auc_robot = (add_errors_robot < d_threshold).float().mean().item()
+
+                        # 🚀 [개선] valid_mask 적용 (robot-frame도)
+                        if valid_mask.any():
+                            kp_error_mm_robot_masked = kp_error_mm_robot.clone()
+                            kp_error_mm_robot_masked[~valid_mask_expanded_2d] = 0.0
+                            mae_3d_per_joint_robot = (kp_error_mm_robot_masked.sum(dim=0) / valid_mask.float().sum()).clamp(min=0)
+                            valid_errors_robot = kp_error_mm_robot[valid_mask]
+                            mean_3d_error_robot = valid_errors_robot.mean().item()
+                            median_3d_error_robot = torch.median(valid_errors_robot).item()
+                            add_auc_robot = (valid_errors_robot < d_threshold).float().mean().item()
+                        else:
+                            mae_3d_per_joint_robot = torch.zeros(7, device=device)
+                            mean_3d_error_robot = 0.0
+                            median_3d_error_robot = 0.0
+                            add_auc_robot = 0.0
                     else:
                         mae_3d_per_joint_robot = None
                         mean_3d_error_robot = None
@@ -500,8 +547,13 @@ def main(args):
                     # ADD AUC: 오차가 0.1d (d=평균 객체 크기) 이내인 비율
                     # 로봇 팔 평균 크기 ~1m → d_threshold = 100mm
                     d_threshold = 100  # mm
-                    add_errors = kp_error_mm.flatten()
-                    add_auc = (add_errors < d_threshold).float().mean().item()
+
+                    # 🚀 [개선] valid_mask 적용
+                    if valid_mask.any():
+                        add_errors = kp_error_mm[valid_mask].flatten()
+                        add_auc = (add_errors < d_threshold).float().mean().item()
+                    else:
+                        add_auc = 0.0
 
                     # ==================== 콘솔 로그 ====================
                     print("\n" + "="*60)
