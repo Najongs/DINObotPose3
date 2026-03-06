@@ -60,16 +60,32 @@ def keypoint_metrics(keypoints_detected, keypoints_gt, image_resolution, auc_pix
             if kp_proj_detect[0] > -999:
                 error = np.linalg.norm(kp_proj_detect - kp_proj_gt)
                 kp_errors.append(error)
+    
     kp_errors = np.array(kp_errors)
+    results = {"num_gt_inframe": num_gt_inframe}
+    
     if len(kp_errors) > 0:
-        kp_l2_error_mean = np.mean(kp_errors)
+        results["l2_error_mean_px"] = np.mean(kp_errors)
+        
+        # 🚀 PCK @ 2.5, 5, 10px 계산
+        for thresh in [2.5, 5.0, 10.0]:
+            pck = len(np.where(kp_errors < thresh)[0]) / max(1, num_gt_inframe)
+            results[f"pck_{thresh}"] = pck
+            
+        # AUC 계산
         delta_pixel = 0.1
         pck_values = np.arange(0, auc_pixel_threshold, delta_pixel)
         y_values = [len(np.where(kp_errors < v)[0]) for v in pck_values]
         kp_auc = np.trapz(y_values, dx=delta_pixel) / auc_pixel_threshold / max(1, num_gt_inframe)
+        results["l2_error_auc"] = kp_auc
     else:
-        kp_l2_error_mean, kp_auc = 512.0, 0.0
-    return {"l2_error_mean_px": kp_l2_error_mean, "l2_error_auc": kp_auc, "num_gt_inframe": num_gt_inframe}
+        results["l2_error_mean_px"] = 512.0
+        results["l2_error_auc"] = 0.0
+        results["pck_2.5"] = 0.0
+        results["pck_5.0"] = 0.0
+        results["pck_10.0"] = 0.0
+        
+    return results
 
 class HeatmapModel(nn.Module):
     def __init__(self, model_name, heatmap_size, unfreeze_blocks=2):
@@ -106,13 +122,14 @@ def main(args):
         data_dir=args.data_dir[0], keypoint_names=keypoint_names,
         image_size=(args.image_size, args.image_size), heatmap_size=(args.heatmap_size, args.heatmap_size),
         augment=not args.no_augment, fda_real_dir=args.fda_real_dir, fda_prob=args.fda_prob, fda_beta=args.fda_beta,
-        sigma=8.0
+        occlusion_prob=args.occlusion_prob, occlusion_max_size_frac=args.occlusion_size,
+        sigma=2.5
     )
     if args.val_dir:
         val_dataset = PoseEstimationDataset(
             data_dir=args.val_dir, keypoint_names=keypoint_names,
             image_size=(args.image_size, args.image_size), heatmap_size=(args.heatmap_size, args.heatmap_size),
-            augment=False, sigma=8.0
+            augment=False, sigma=2.5
         )
         train_dataset = full_train_dataset
     else:
@@ -158,7 +175,7 @@ def main(args):
     
     if local_rank != -1: model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
     
-    joint_weights = torch.tensor([1.2, 1.1, 1.0, 1.0, 1.1, 1.2, 1.2]).to(device)
+    joint_weights = torch.tensor([2.5, 1.5, 1.3, 1.0, 1.3, 1.5, 2.5]).to(device)
     criterion = nn.MSELoss(reduction='none')
     loss_scale = 1000.0
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -204,10 +221,14 @@ def main(args):
                 weighted_val_loss = (raw_val_loss * joint_weights.view(1, -1)).mean() * loss_scale
                 val_loss += weighted_val_loss.item()
                 if i == 0: viz_batch = (imgs, gt_hms, preds)
+                
+                # 🚀 [수정] soft-argmax를 지우고 원래의 argmax 코드로 원상복구!
                 B, N, H, W = preds.shape
                 max_idx = preds.view(B, N, -1).argmax(dim=-1)
                 pred_coords = torch.stack([max_idx % W, max_idx // W], dim=-1).cpu().numpy()
-                all_preds.append(pred_coords); all_gts.append(batch['keypoints'].numpy())
+                
+                all_preds.append(pred_coords)
+                all_gts.append(batch['keypoints'].numpy())
 
         val_loss /= len(val_loader) if len(val_loader) > 0 else 1
         val_joint_losses /= len(val_loader) if len(val_loader) > 0 else 1
@@ -217,7 +238,10 @@ def main(args):
         else: current_auc, current_l2 = 0.0, 512.0
 
         if is_main:
+            # 🚀 [수정됨] 터미널에 상세 지표(PCK@2.5, 5, 10) 출력
             print(f"Epoch {epoch} | Val Loss: {val_loss:.4f} | AUC: {current_auc:.4f} | L2: {current_l2:.2f}px")
+            print(f"PCK@2.5: {metrics.get('pck_2.5', 0):.4f} | PCK@5: {metrics.get('pck_5.0', 0):.4f} | PCK@10: {metrics.get('pck_10.0', 0):.4f}")
+            
             log_dict = {'epoch': epoch, 'train_loss_total': train_loss_accum/len(train_loader), 'val_loss_total': val_loss, 'val_auc': current_auc, 'val_l2_px': current_l2, 'learning_rate': optimizer.param_groups[0]['lr']}
             for idx, name in enumerate(keypoint_names):
                 log_dict[f'train_joint_loss/{name}'] = train_joint_losses[idx].item()
@@ -247,6 +271,8 @@ if __name__ == '__main__':
     parser.add_argument('--unfreeze-blocks', type=int, default=2)
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--no-augment', action='store_true', help='Disable general data augmentation')
+    parser.add_argument('--occlusion-prob', type=float, default=0.5, help='Probability of occlusion augmentation')
+    parser.add_argument('--occlusion-size', type=float, default=0.2, help='Max size of occlusion patch relative to image')
     parser.add_argument('--fda-real-dir', type=str, default=None)
     parser.add_argument('--fda-prob', type=float, default=0.0)
     parser.add_argument('--fda-beta', type=float, default=0.05)

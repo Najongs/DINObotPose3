@@ -1,177 +1,72 @@
 {
-<<<<<<< HEAD
-  "panda_link0_2d_px": 18.811330795288086,
-  "panda_link2_2d_px": 346.8660583496094,
-  "panda_link3_2d_px": 232.2896270751953,
-  "panda_link4_2d_px": 236.07635498046875,
-  "panda_link6_2d_px": 171.1798858642578,
-  "panda_link7_2d_px": 511.83197021484375,
-  "panda_hand_2d_px": 320.185302734375,
-  "mean_2d_px": 262.4629211425781,
-  "max_2d_px": 511.83197021484375,
-  "median_2d_px": 236.07635498046875,
-  "panda_link0_3d_m": 0.6491285946950832,
-  "panda_link2_3d_m": 0.6683764450313969,
-  "panda_link3_3d_m": 0.7991876743745709,
-  "panda_link4_3d_m": 0.7637909789058059,
-  "panda_link6_3d_m": 0.9669549297578757,
-  "panda_link7_3d_m": 1.0375081096729701,
-  "panda_hand_3d_m": 1.113096015896263,
-  "mean_3d_m": 0.856863249761995,
-  "max_3d_m": 1.113096015896263,
-  "median_3d_m": 0.7991876743745709,
-  "mean_2d_norm": 32.807865142822266,
-  "json_path": "/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_test_dr/000001.json",
-  "image_path": "/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/DREAM_syn/panda_synth_test_dr/000001.rgb.jpg",
-  "ignored_keypoints": {
-    "low_peak_logit": [],
-    "low_conf": [],
-    "reproj_outlier": [
-      "panda_link0",
-      "panda_link2",
-      "panda_link3",
-      "panda_link4",
-=======
-  "panda_link0_2d_px": 0.3312125504016876,
-  "panda_link2_2d_px": 1.4723467826843262,
-  "panda_link3_2d_px": 2.6360299587249756,
-  "panda_link4_2d_px": 3.8096559047698975,
-  "panda_link6_2d_px": 21.403213500976562,
-  "panda_link7_2d_px": 25.2385196685791,
-  "panda_hand_2d_px": 25.40089988708496,
-  "mean_2d_px": 11.470268249511719,
-  "max_2d_px": 25.40089988708496,
-  "median_2d_px": 3.8096559047698975,
-  "panda_link0_3d_m": 0.047683767067342654,
-  "panda_link2_3d_m": 0.07441883396705501,
-  "panda_link3_3d_m": 0.10423051586145109,
-  "panda_link4_3d_m": 0.10737818702347036,
-  "panda_link6_3d_m": 0.10619541473450449,
-  "panda_link7_3d_m": 0.11163864798014766,
-  "panda_hand_3d_m": 0.11132089203865361,
-  "mean_3d_m": 0.09469517981037498,
-  "max_3d_m": 0.11163864798014766,
-  "median_3d_m": 0.10619541473450449,
-  "mean_2d_norm": 1.4337835311889648,
-  "json_path": "/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-orb/031945.json",
-  "image_path": "/data/public/NAS/DINObotPose2/Dataset/DREAM_real/panda-orb/panda-orb/031945.rgb.jpg",
-  "ignored_keypoints": {
-    "low_peak_logit": [
->>>>>>> 4e41e1250ca28b42d13188b35a1f3cab6fbf58ea
-      "panda_link6",
-      "panda_link7",
-      "panda_hand"
+  "pred_angles_deg": [
+    -81.21724700927734,
+    40.70589828491211,
+    12.988865852355957,
+    -97.12275695800781,
+    -117.02799224853516,
+    18.189302444458008,
+    0.0
+  ],
+  "pred_2d": [
+    [
+      243.67372131347656,
+      398.1907043457031
     ],
-<<<<<<< HEAD
-=======
-    "low_conf": [],
-    "reproj_outlier": [],
->>>>>>> 4e41e1250ca28b42d13188b35a1f3cab6fbf58ea
-    "pnp_select": []
-  },
-  "pnp": {
-    "mode": "epnp",
-    "reproj_outlier_thresh_px": 12.0,
-<<<<<<< HEAD
-    "min_span_px": 20.0,
-=======
-    "min_span_px": 5.0,
->>>>>>> 4e41e1250ca28b42d13188b35a1f3cab6fbf58ea
-    "min_area_ratio": 0.001,
-    "used_keypoints": [
-      0,
-      1,
-      2,
-<<<<<<< HEAD
-      3,
-      4,
-      5,
-      6
+    [
+      241.25222778320312,
+      271.63311767578125
     ],
-    "removed_reproj_keypoints": [
-      0,
-      1,
-      2,
-      3,
-      4,
-      5,
-      6
+    [
+      271.043212890625,
+      147.4931182861328
     ],
-    "spread_ok": true,
-    "spread_span_xy_px": [
-      636.25,
-      476.25
+    [
+      301.09478759765625,
+      158.21469116210938
     ],
-    "spread_area_ratio": 0.9863739013671875
-  },
-  "heatmap_peak": {
-    "panda_link0": {
-      "peak_logit": 0.012141138315200806,
-      "peak_sigmoid": 0.5030352473258972
-    },
-    "panda_link2": {
-      "peak_logit": 0.01289318222552538,
-      "peak_sigmoid": 0.5032232403755188
-    },
-    "panda_link3": {
-      "peak_logit": 0.009865254163742065,
-      "peak_sigmoid": 0.5024663209915161
-    },
-    "panda_link4": {
-      "peak_logit": 0.010415220633149147,
-      "peak_sigmoid": 0.5026037693023682
-    },
-    "panda_link6": {
-      "peak_logit": 0.011913012713193893,
-      "peak_sigmoid": 0.5029782056808472
-    },
-    "panda_link7": {
-      "peak_logit": 0.009426646865904331,
-      "peak_sigmoid": 0.5023565888404846
-    },
-    "panda_hand": {
-      "peak_logit": 0.013345167972147465,
-      "peak_sigmoid": 0.5033362507820129
-=======
-      3
+    [
+      486.7008972167969,
+      238.08377075195312
     ],
-    "removed_reproj_keypoints": [],
-    "spread_ok": true,
-    "spread_span_xy_px": [
-      31.25,
-      253.125
+    [
+      538.4669799804688,
+      206.42120361328125
     ],
-    "spread_area_ratio": 0.023925709812108464
-  },
-  "heatmap_peak": {
-    "panda_link0": {
-      "peak_logit": 0.7195149064064026,
-      "peak_sigmoid": 0.6725001931190491
-    },
-    "panda_link2": {
-      "peak_logit": 0.7889575362205505,
-      "peak_sigmoid": 0.68760746717453
-    },
-    "panda_link3": {
-      "peak_logit": 0.7332313060760498,
-      "peak_sigmoid": 0.6755139827728271
-    },
-    "panda_link4": {
-      "peak_logit": 0.8038015961647034,
-      "peak_sigmoid": 0.6907870769500732
-    },
-    "panda_link6": {
-      "peak_logit": 0.2405666708946228,
-      "peak_sigmoid": 0.5598533153533936
-    },
-    "panda_link7": {
-      "peak_logit": 0.06579406559467316,
-      "peak_sigmoid": 0.516442596912384
-    },
-    "panda_hand": {
-      "peak_logit": 0.09757842868566513,
-      "peak_sigmoid": 0.5243752598762512
->>>>>>> 4e41e1250ca28b42d13188b35a1f3cab6fbf58ea
-    }
-  }
+    [
+      578.5874633789062,
+      267.3114013671875
+    ]
+  ],
+  "mean_2d_error_px": 5.067794322967529,
+  "gt_angles_deg": [
+    3.3122475147247314,
+    18.158700942993164,
+    -6.050428867340088,
+    -102.9829330444336,
+    -15.816930770874023,
+    155.74913024902344,
+    53.24202346801758
+  ],
+  "angle_errors_deg": [
+    84.52949523925781,
+    22.54719352722168,
+    19.039295196533203,
+    5.8601789474487305,
+    101.2110595703125,
+    137.55984497070312,
+    53.242027282714844
+  ],
+  "mean_angle_error_deg": 60.56987380981445,
+  "mean_3d_error_mm": 760.1254272460938,
+  "per_joint_3d_error_mm": [
+    670.1519165039062,
+    563.8837890625,
+    672.333251953125,
+    679.9518432617188,
+    890.7283325195312,
+    958.5228881835938,
+    885.30615234375
+  ],
+  "pnp_valid": false
 }

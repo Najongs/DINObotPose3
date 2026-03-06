@@ -3,86 +3,41 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Model checkpoint
-<<<<<<< HEAD
-MODEL_PATH="/home/najo/NAS/DIP/DINObotPose3/TRAIN/outputs/dinov3_base_20260303_170451_no/best_model.pth"
+# Model checkpoint (use latest 3D training output)
+# Find the most recent outputs_3d directory
+LATEST_3D_DIR=$(ls -dt ${SCRIPT_DIR}/../TRAIN/outputs_3d/train_3d_* 2>/dev/null | head -1)
 
-# Input annotation JSON (contains image path + GT keypoints + camera K)
-JSON_PATH="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_test_dr/000001.json"
-=======
-MODEL_PATH="/data/public/NAS/DINObotPose3/TRAIN/outputs/dinov3_base_20260303_020716/epoch_56.pth"
-
-# Input annotation JSON (contains image path + GT keypoints + camera K)
-JSON_PATH="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-orb/031945.json"
->>>>>>> 4e41e1250ca28b42d13188b35a1f3cab6fbf58ea
-
-# Output directory
-OUTPUT_DIR="${SCRIPT_DIR}/real_inference_output"
-
-# Inference options
-PRED_3D_SOURCE="fk_robopepp"
-ROBOPEPP_FIX_JOINT7_ZERO=1
-PNP_MODE="epnp"  # epnp (baseline) | loo_epnp (alternative) | ransac
-PNP_TOPK=6
-PNP_RANSAC_REPROJ_ERROR=5.0
-<<<<<<< HEAD
-KP_MIN_CONFIDENCE=0.001  # mask low-confidence 2D keypoints as invalid (-999)
-KP_MIN_PEAK_LOGIT=0.001  # mask low-peak heatmap keypoints as invalid (-999)
-=======
-KP_MIN_CONFIDENCE=0.25  # mask low-confidence 2D keypoints as invalid (-999)
-KP_MIN_PEAK_LOGIT=0.25  # mask low-peak heatmap keypoints as invalid (-999)
->>>>>>> 4e41e1250ca28b42d13188b35a1f3cab6fbf58ea
-PNP_REPROJ_OUTLIER_THRESH=12.0  # reject high-reprojection-error points and refit
-PNP_MIN_SPAN_PX=5.0  # reject PnP if selected points are too concentrated
-PNP_MIN_AREA_RATIO=0.001
-FILL_INVALID_2D_WITH_FK_REPROJ=1  # fill low-reliability 2D with FK reprojection after successful PnP
-PNP_Z_SEARCH_MIN_M=-0.05
-PNP_Z_SEARCH_MAX_M=0.05
-PNP_Z_SEARCH_STEP_M=0.001
-
-echo "=========================================="
-echo "  Real Image Inference (GT vs Prediction)"
-echo "=========================================="
-echo "  Model: ${MODEL_PATH}"
-echo "  JSON:  ${JSON_PATH}"
-echo "  Output: ${OUTPUT_DIR}"
-echo "  PnP mode: ${PNP_MODE}"
-echo "  Keypoint min confidence: ${KP_MIN_CONFIDENCE}"
-echo "  Keypoint min peak logit: ${KP_MIN_PEAK_LOGIT}"
-echo "  PnP reproj outlier threshold: ${PNP_REPROJ_OUTLIER_THRESH}px"
-echo "  PnP min span: ${PNP_MIN_SPAN_PX}px, min area ratio: ${PNP_MIN_AREA_RATIO}"
-echo "  PnP Z-search: [${PNP_Z_SEARCH_MIN_M}, ${PNP_Z_SEARCH_MAX_M}] m step ${PNP_Z_SEARCH_STEP_M} m"
-echo "  RoboPEPP joint7=0: ${ROBOPEPP_FIX_JOINT7_ZERO}"
-echo ""
-
-if [[ "${JSON_PATH}" != *.json ]]; then
-    echo "Error: JSON_PATH must point to a .json annotation file, got: ${JSON_PATH}"
-    exit 1
+if [ -n "$LATEST_3D_DIR" ] && [ -f "$LATEST_3D_DIR/best_3d_pose.pth" ]; then
+    MODEL_PATH="$LATEST_3D_DIR/best_3d_pose.pth"
+elif [ -n "$LATEST_3D_DIR" ] && [ -f "$LATEST_3D_DIR/last_3d_pose.pth" ]; then
+    MODEL_PATH="$LATEST_3D_DIR/last_3d_pose.pth"
+else
+    # Fallback to heatmap-only checkpoint
+    MODEL_PATH="/data/public/NAS/DINObotPose3/TRAIN/outputs_3d/train_3d_20260306_062016/best_3d_pose.pth"
+    echo "WARNING: No 3D checkpoint found, falling back to heatmap checkpoint"
 fi
 
-python "${SCRIPT_DIR}/inference_with_real.py" \
-    -j "${JSON_PATH}" \
-    -p "${MODEL_PATH}" \
-    -o "${OUTPUT_DIR}" \
-    --pred-3d-source "${PRED_3D_SOURCE}" \
-    $( [[ "${ROBOPEPP_FIX_JOINT7_ZERO}" == "1" ]] && echo "--robopepp-fix-joint7-zero" ) \
-    --pnp-mode "${PNP_MODE}" \
-    --pnp-topk "${PNP_TOPK}" \
-    --pnp-ransac-reproj-error "${PNP_RANSAC_REPROJ_ERROR}" \
-    --pnp-reproj-outlier-thresh "${PNP_REPROJ_OUTLIER_THRESH}" \
-    --pnp-min-span-px "${PNP_MIN_SPAN_PX}" \
-    --pnp-min-area-ratio "${PNP_MIN_AREA_RATIO}" \
-    --pnp-z-search-min-m "${PNP_Z_SEARCH_MIN_M}" \
-    --pnp-z-search-max-m "${PNP_Z_SEARCH_MAX_M}" \
-    --pnp-z-search-step-m "${PNP_Z_SEARCH_STEP_M}" \
-    --kp-min-peak-logit "${KP_MIN_PEAK_LOGIT}" \
-    --kp-min-confidence "${KP_MIN_CONFIDENCE}" \
-    $( [[ "${FILL_INVALID_2D_WITH_FK_REPROJ}" == "1" ]] && echo "--fill-invalid-2d-with-fk-reproj" )
+JSON_PATH="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_real/panda-3cam_azure/001569.json"
+OUTPUT_DIR="./real_inference_output"
+
+echo "=========================================="
+echo "  Real Image Inference (3D Pose)"
+echo "=========================================="
+echo "  Model:  $MODEL_PATH"
+echo "  JSON:   $JSON_PATH"
+echo "  Output: $OUTPUT_DIR"
+echo "=========================================="
+
+cd "$SCRIPT_DIR"
+
+python inference_with_real.py \
+    --json-path "$JSON_PATH" \
+    --model-path "$MODEL_PATH" \
+    --output-dir "$OUTPUT_DIR" \
+    --model-name "facebook/dinov3-vitb16-pretrain-lvd1689m" \
+    --fix-joint7
 
 echo ""
-echo "Results saved to: ${OUTPUT_DIR}"
-echo "  01_gt_vs_pred_keypoints.png  - Green=GT, Red=Prediction"
-echo "  02_belief_map_mosaic.png     - Per-joint belief maps"
-echo "  03_belief_maps_overlay_mosaic.png - Belief maps on image"
-echo "  04_combined_on_original.png  - Combined heatmap on original"
-echo "  metrics.json                 - Per-keypoint error metrics"
+echo "Results saved to: $OUTPUT_DIR"
+echo "  inference_overlay.png  - GT (Green) vs Prediction (Red)"
+echo "  metrics.json           - Quantitative results"

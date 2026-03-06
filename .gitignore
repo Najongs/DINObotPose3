@@ -8,6 +8,7 @@ __pycache__/
 RoboPEPP/
 robopose/
 outputs/
+output*/
 .claude/
 Dataset/
 DREAM/
@@ -16,6 +17,10 @@ eval_outputs*/
 panda-description/
 wandb/
 outputs_heatmap/
+
+*.pt
+*.pth
+*.png
 # Distribution / packaging
 .Python
 build/

@@ -28,7 +28,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # Optional DREAM utilities (fallback to OpenCV-only path when unavailable)
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../DREAM")))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "/data/public/NAS/DINObotPose2/DREAM")))
 try:
     import dream  # type: ignore
     DREAM_AVAILABLE = True

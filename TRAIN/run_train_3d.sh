@@ -12,15 +12,16 @@ NUM_GPUS=3
 export CUDA_VISIBLE_DEVICES=${GPU_IDS}
 
 # Data paths
-TRAIN_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"
+TRAIN_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_real"
 VAL_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_real/panda-3cam_azure"
 
-# 2D Pretrained Checkpoint (required)
+# 2D Pretrained Checkpoint (required for fresh start)
 CHECKPOINT="/data/public/NAS/DINObotPose3/TRAIN/outputs_heatmap/best_heatmap.pth"
 
-# 2D Pretrained Checkpoint (필수)
-# 2D Heatmap 학습이 완료된 'best_heatmap.pth' 경로를 입력하세요.
-CHECKPOINT="/data/public/NAS/DINObotPose3/TRAIN/outputs_heatmap/best_heatmap.pth"
+# 3D Checkpoint (optional - resume from previous 3D training)
+# Set to empty string "" for fresh start, or path to resume
+# Head architecture changed - must start fresh from 2D checkpoint
+CHECKPOINT_3D=""
 
 # Model configuration
 MODEL_NAME='facebook/dinov3-vitb16-pretrain-lvd1689m'
@@ -29,9 +30,9 @@ HEATMAP_SIZE=512
 
 # Training hyperparameters - 🚀 [최적화] 각도 학습 집중
 EPOCHS=50        # 적당한 에폭 (각도만 맞으면 됨)
-BATCH_SIZE=16    # 안정적 학습
+BATCH_SIZE=32    # 안정적 학습
 NUM_WORKERS=4
-LEARNING_RATE=1e-4   # 표준 LR (각도 직접 예측이므로 안정적)
+LEARNING_RATE=5e-5   # 표준 LR (각도 직접 예측이므로 안정적)
 MIN_LR=1e-7      # 표준 극저 LR
 WARMUP_STEPS=500     # 표준 warmup
 GRAD_CLIP=1.0
@@ -40,9 +41,12 @@ GRAD_CLIP=1.0
 ANGLE_WEIGHT=1.0    # Sin/Cos loss weight
 FK_3D_WEIGHT=0.0    # FK disabled during training (metric only in validation)
 
+# Validation settings
+VAL_RATIO=0.5       # Use 50% of validation set for faster validation
+
 # Sim-to-Real Augmentation (🚀 강화됨)
-OCC_PROB=0.6        # 강력한 occlusion (60% 확률)
-OCC_SIZE=0.4        # 더 큰 occlusion 패치
+OCC_PROB=0.25
+OCC_SIZE=0.2
 
 # WANDB Settings
 WANDB_PROJECT="dinov3-3d-pose"
@@ -54,9 +58,18 @@ OUTPUT_DIR="./outputs_3d/train_3d_${TIMESTAMP}"
 # Execution
 # =============================================================================
 
+# Build checkpoint args
+CKPT_ARGS=""
+if [ -n "${CHECKPOINT_3D}" ] && [ -f "${CHECKPOINT_3D}" ]; then
+    CKPT_ARGS="--checkpoint-3d ${CHECKPOINT_3D}"
+    echo "==> Resuming from 3D checkpoint: ${CHECKPOINT_3D}"
+else
+    CKPT_ARGS="--checkpoint ${CHECKPOINT}"
+    echo "==> Fresh start from 2D checkpoint: ${CHECKPOINT}"
+fi
+
 echo "============================================================================="
 echo "==> STARTING 3D POSE TRAINING (STABLE FK MODE)"
-echo "==> 2D Checkpoint: ${CHECKPOINT}"
 echo "==> Params: LR=${LEARNING_RATE}, Warmup=${WARMUP_STEPS}, Occ=${OCC_PROB}"
 echo "==> Output: ${OUTPUT_DIR}"
 echo "============================================================================="
@@ -64,7 +77,7 @@ echo "==========================================================================
 torchrun --standalone --nnodes=1 --nproc_per_node=${NUM_GPUS} train_3d.py \
     --train-dir "${TRAIN_DIR}" \
     --val-dir "${VAL_DIR}" \
-    --checkpoint "${CHECKPOINT}" \
+    ${CKPT_ARGS} \
     --model-name "${MODEL_NAME}" \
     --output-dir "${OUTPUT_DIR}" \
     --image-size ${IMAGE_SIZE} \
@@ -77,10 +90,10 @@ torchrun --standalone --nnodes=1 --nproc_per_node=${NUM_GPUS} train_3d.py \
     --grad-clip ${GRAD_CLIP} \
     --angle-weight ${ANGLE_WEIGHT} \
     --fk-3d-weight ${FK_3D_WEIGHT} \
+    --val-ratio ${VAL_RATIO} \
     --occlusion-prob ${OCC_PROB} \
     --occlusion-size ${OCC_SIZE} \
     --num-workers ${NUM_WORKERS} \
-    --mode joint_angle \
     --use-wandb \
     --wandb-project "${WANDB_PROJECT}" \
     --wandb-run-name "${RUN_NAME}"

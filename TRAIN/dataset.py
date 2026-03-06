@@ -189,32 +189,29 @@ class PoseEstimationDataset(Dataset):
 
         # 데이터 증강 설정
         if self.augment:
-            # 🚀 [적당한 수준] Sim-to-Real 일반화 + 수렴 우선
-            occ_max_frac = max(0.05, min(0.6, float(self.occlusion_max_size_frac)))
-            occ_min_frac = min(0.04, occ_max_frac)
+            # 🚀 [경량] 학습 수렴 우선 — 최소한의 augmentation
             self.augmentation = albu.Compose([
-                # 1. 적당한 노이즈
-                albu.GaussNoise(p=0.3),
+                # 1. 가벼운 노이즈 (강도↓, 확률↓)
+                albu.GaussNoise(std_range=(0.01, 0.03), p=0.15),
 
-                # 2. 적당한 색상 변화
-                albu.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.4),
-                albu.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=20, val_shift_limit=15, p=0.3),
+                # 2. 약한 색상 변화 (brightness/contrast 절반, hue 제거)
+                albu.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.2),
 
-                # 3. Occlusion (적당한 수준)
+                # 3. Occlusion 최소화 (작은 패치 1-2개, 낮은 확률)
                 albu.CoarseDropout(
-                    num_holes_range=(1, max(3, self.occlusion_max_holes)),
-                    hole_height_range=(0.08, 0.3),
-                    hole_width_range=(0.08, 0.3),
+                    num_holes_range=(1, 2),
+                    hole_height_range=(0.03, 0.1),
+                    hole_width_range=(0.03, 0.1),
                     fill=0,
-                    p=0.4,
+                    p=0.15,
                 ),
 
-                # 4. 기하학적 변환 (제한적)
+                # 4. 기하학적 변환 최소화 (shift/scale만, rotation 거의 없음)
                 albu.ShiftScaleRotate(
-                    shift_limit=0.1,
-                    scale_limit=0.1,
-                    rotate_limit=10,
-                    p=0.3
+                    shift_limit=0.05,
+                    scale_limit=0.05,
+                    rotate_limit=5,
+                    p=0.15
                 ),
 
             ], keypoint_params=albu.KeypointParams(format='xy', remove_invisible=False))
