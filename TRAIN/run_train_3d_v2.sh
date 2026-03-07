@@ -11,7 +11,7 @@ GPU_IDS="0,1,2"
 NUM_GPUS=3
 export CUDA_VISIBLE_DEVICES=${GPU_IDS}
 
-TRAIN_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_real"
+TRAIN_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_train_dr"
 VAL_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_real/panda-3cam_azure"
 CHECKPOINT="/data/public/NAS/DINObotPose3/TRAIN/outputs_heatmap/best_heatmap.pth"
 
@@ -22,15 +22,16 @@ HEATMAP_SIZE=512
 EPOCHS=100
 BATCH_SIZE=32
 NUM_WORKERS=4
-LEARNING_RATE=1e-4
+LEARNING_RATE=5e-5
 WARMUP_STEPS=500
 GRAD_CLIP=1.0
+WEIGHT_DECAY=0.1
 
 # Backbone unfreeze config
-UNFREEZE_BLOCKS=2          # Last 2 transformer blocks
-WARMUP_FROZEN_EPOCHS=5     # Keep frozen for first 5 epochs
+UNFREEZE_BLOCKS=2          # Last 2 transformer blocks only (conservative)
+WARMUP_FROZEN_EPOCHS=10    # Let angle head converge first
 
-VAL_RATIO=0.5
+VAL_RATIO=1.0
 OCC_PROB=0.25
 OCC_SIZE=0.2
 
@@ -60,6 +61,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=${NUM_GPUS} train_3d_v2.py \
     --lr ${LEARNING_RATE} \
     --warmup-steps ${WARMUP_STEPS} \
     --grad-clip ${GRAD_CLIP} \
+    --weight-decay ${WEIGHT_DECAY} \
     --unfreeze-blocks ${UNFREEZE_BLOCKS} \
     --warmup-frozen-epochs ${WARMUP_FROZEN_EPOCHS} \
     --val-ratio ${VAL_RATIO} \

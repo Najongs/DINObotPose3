@@ -479,124 +479,67 @@ def panda_forward_kinematics(joint_angles):
     return torch.stack(keypoints, dim=1)
 
 
-class IterativeJointAngleHead(nn.Module):
+class DirectJointAngleHead(nn.Module):
     """
-    Iterative angle refinement (inspired by RoboPEPP).
-    Step 1: Direct sin/cos prediction from features.
-    Steps 2-4: Residual refinement on sin/cos.
+    Feature + UV with confidence weighting.
+    Use UV but weight by heatmap confidence.
     """
 
     def __init__(self, input_dim=768, num_joints=7, num_angles=7):
         super().__init__()
-        self.num_joints = num_joints
         self.num_angles = num_angles
-        self.hidden_dim = 512
+        self.num_joints = num_joints
         self.n_iter = 4
 
-        limits = torch.tensor(_PANDA_JOINT_LIMITS, dtype=torch.float32)[:self.num_angles]
-        self.register_buffer('joint_lower', limits[:, 0])
-        self.register_buffer('joint_upper', limits[:, 1])
-
-        # 1. Feature extraction from DINOv3
-        self.feature_proj = nn.Sequential(
-            nn.Linear(input_dim, self.hidden_dim),
-            nn.LayerNorm(self.hidden_dim),
-            nn.GELU()
+        # UV encoder
+        self.uv_encoder = nn.Sequential(
+            nn.Linear(num_joints * 2, 256),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Linear(256, 256)
         )
 
-        # 2. Per-joint spatial encoding (preserves individual joint locations)
-        self.heatmap_encoder = nn.Sequential(
-            nn.Linear(num_joints * 2, 256), nn.GELU(),
-            nn.LayerNorm(256),
-            nn.Linear(256, self.hidden_dim)
+        # Confidence encoder (weight UV by heatmap quality)
+        self.conf_encoder = nn.Sequential(
+            nn.Linear(num_joints, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+            nn.Sigmoid()  # 0~1 weight
         )
 
-        # 3. Initial sin/cos prediction (NOT delta — direct prediction)
-        self.initial_mlp = nn.Sequential(
-            nn.Linear(self.hidden_dim * 2, 1024),
-            nn.GELU(),
-            nn.Linear(1024, 512),
-            nn.GELU(),
-            nn.Linear(512, num_angles * 2),  # Direct (cos, sin) prediction
-        )
-
-        # 4. Iterative refinement: [features + current_sin_cos] → delta
-        self.refine_mlp = nn.Sequential(
-            nn.Linear(self.hidden_dim * 2 + num_angles * 2, 1024),
-            nn.GELU(),
-            nn.Linear(1024, 1024),
-            nn.GELU(),
-        )
-        self.angle_delta = nn.Linear(1024, num_angles)
-
-        self.dropout = nn.Dropout(p=0.1)
-
-        # Refinement delta: small init (refinement steps should start small)
-        nn.init.xavier_uniform_(self.angle_delta.weight, gain=0.01)
-        if self.angle_delta.bias is not None:
-            nn.init.zeros_(self.angle_delta.bias)
+        # Iterative residual
+        self.fc1 = nn.Linear(input_dim + 256 + num_angles, 1024)
+        self.fc2 = nn.Linear(1024, 1024)
+        self.decpose = nn.Linear(1024, num_angles)
+        self.drop1 = nn.Dropout(p=0.3)
+        self.drop2 = nn.Dropout(p=0.3)
+        nn.init.xavier_uniform_(self.decpose.weight, gain=0.01)
 
     def forward(self, dino_features, predicted_heatmaps, camera_K=None):
         B = dino_features.shape[0]
-        device = dino_features.device
+        
+        xf = dino_features.mean(dim=1)  # (B, 768)
+        
+        # UV + confidence
+        uv = soft_argmax_2d(predicted_heatmaps, temperature=100.0)
+        
+        # Heatmap confidence (max value per joint)
+        conf = predicted_heatmaps.flatten(2).max(dim=2)[0]  # (B, N)
+        uv_weight = self.conf_encoder(conf)  # (B, 1)
+        
+        uv_flat = uv.reshape(B, -1)
+        uv_feat = self.uv_encoder(uv_flat) * uv_weight  # Weight by confidence
+        
+        xf_combined = torch.cat([xf, uv_feat], dim=1)
 
-        # 1. Global feature extraction
-        global_feat = F.adaptive_avg_pool2d(
-            dino_features.permute(0, 2, 1).reshape(B, dino_features.shape[2],
-                                                    int(math.sqrt(dino_features.shape[1])),
-                                                    int(math.sqrt(dino_features.shape[1]))), 1
-        ).flatten(1)
-        global_feat = self.feature_proj(global_feat)  # (B, hidden_dim)
+        pred_pose = torch.zeros(B, self.num_angles, device=xf.device)
+        for _ in range(self.n_iter):
+            xc = torch.cat([xf_combined, pred_pose], dim=1)
+            xc = self.drop1(F.relu(self.fc1(xc)))
+            xc = self.drop2(F.relu(self.fc2(xc)))
+            pred_pose = self.decpose(xc) + pred_pose
 
-        # 2. Per-joint spatial features from heatmaps
-        with torch.no_grad():
-            uv_heatmap = soft_argmax_2d(predicted_heatmaps, temperature=100.0)
-        hm_h, hm_w = predicted_heatmaps.shape[2:]
-        u_norm = uv_heatmap[:, :, 0] / hm_w
-        v_norm = uv_heatmap[:, :, 1] / hm_h
-        spatial_info = torch.cat([u_norm, v_norm], dim=-1)
-        spatial_feat = self.heatmap_encoder(spatial_info)
-
-        # 3. Initial direct sin/cos prediction (iteration 0)
-        feat_combined = torch.cat([global_feat, spatial_feat], dim=1)  # (B, hidden_dim*2)
-        pred_sc = self.initial_mlp(feat_combined)  # (B, num_angles*2)
-
-        # Normalize to unit circle
-        cos_init = pred_sc[:, 0::2]
-        sin_init = pred_sc[:, 1::2]
-        norm = torch.sqrt(cos_init**2 + sin_init**2).clamp(min=1e-8)
-        cos_init = cos_init / norm
-        sin_init = sin_init / norm
-        pred_sc = torch.stack([cos_init, sin_init], dim=2).reshape(B, self.num_angles * 2)
-
-        # 4. Refinement iterations (iterations 1-3)
-        for iter_step in range(self.n_iter - 1):
-            combined = torch.cat([global_feat, spatial_feat, pred_sc], dim=1)
-
-            x = self.refine_mlp(combined)
-            x = self.dropout(x)
-            delta = self.angle_delta(x)
-
-            cos_prev = pred_sc[:, 0::2]
-            sin_prev = pred_sc[:, 1::2]
-
-            cos_new = cos_prev - sin_prev * delta
-            sin_new = sin_prev + cos_prev * delta
-
-            norm = torch.sqrt(cos_new**2 + sin_new**2).clamp(min=1e-8)
-            cos_new = cos_new / norm
-            sin_new = sin_new / norm
-
-            pred_sc = torch.stack([cos_new, sin_new], dim=2).reshape(B, self.num_angles * 2)
-
-        # Convert sin/cos back to angles for FK
-        cos_final = pred_sc[:, 0::2]
-        sin_final = pred_sc[:, 1::2]
-        pred_angles = torch.atan2(sin_final, cos_final)
-
-        return pred_angles, panda_forward_kinematics(
-            pred_angles if self.num_angles == 7 else torch.cat([pred_angles, torch.zeros(B, 7-self.num_angles, device=device)], dim=1)
-        ), pred_sc
+        return pred_pose, uv, None
 
 
 class DINOv3PoseEstimator(nn.Module):
@@ -608,60 +551,21 @@ class DINOv3PoseEstimator(nn.Module):
         self.keypoint_head = ViTKeypointHead(input_dim=feat_dim, heatmap_size=heatmap_size)
 
         # Joint angle head
-        self.joint_angle_head = IterativeJointAngleHead(input_dim=feat_dim, num_joints=NUM_JOINTS, num_angles=6 if fix_joint7_zero else 7)
+        self.joint_angle_head = DirectJointAngleHead(input_dim=feat_dim, num_joints=NUM_JOINTS, num_angles=6 if fix_joint7_zero else 7)
 
     def forward(self, image_tensor_batch, camera_K=None, **kwargs):
         dino_features = self.backbone(image_tensor_batch)
         predicted_heatmaps = self.keypoint_head(dino_features)
 
-        # Joint Angle mode: angles → FK → robot-frame 3D
-        joint_angles, kpts_3d_robot, pred_sin_cos = self.joint_angle_head(dino_features, predicted_heatmaps, camera_K=camera_K)
+        # Joint angle head outputs normalized angles
+        joint_angles_norm, _, _ = self.joint_angle_head(dino_features, predicted_heatmaps, camera_K=camera_K)
         if self.fix_joint7_zero:
-            # Append zero joint7 to the 6-angle output → (B, 7)
-            zeros = torch.zeros(joint_angles.shape[0], 1, device=joint_angles.device)
-            joint_angles = torch.cat([joint_angles, zeros], dim=1)
-            kpts_3d_robot = panda_forward_kinematics(joint_angles)
-            # Append cos(0)=1, sin(0)=0 for joint7
-            pad = torch.tensor([[1.0, 0.0]], device=pred_sin_cos.device).expand(pred_sin_cos.shape[0], -1)
-            pred_sin_cos = torch.cat([pred_sin_cos, pad], dim=1)
+            zeros = torch.zeros(joint_angles_norm.shape[0], 1, device=joint_angles_norm.device)
+            joint_angles_norm = torch.cat([joint_angles_norm, zeros], dim=1)
 
         result = {
             'heatmaps_2d': predicted_heatmaps,
-            'joint_angles': joint_angles,
-            'keypoints_3d_fk': kpts_3d_robot,
-            'keypoints_3d': kpts_3d_robot,
-            'keypoints_3d_robot': kpts_3d_robot,
-            'pred_sin_cos': pred_sin_cos  # 🚀 For sin/cos loss
+            'joint_angles': joint_angles_norm,  # normalized space
         }
-
-        # PnP transformation if camera_K provided
-        if camera_K is not None:
-            uv_2d = soft_argmax_2d(predicted_heatmaps)
-
-            # Per-keypoint confidence: softmax peak value
-            B, N, H, W = predicted_heatmaps.shape
-            hm_flat = predicted_heatmaps.reshape(B, N, -1)
-            kp_confidence = hm_flat.max(dim=-1)[0]  # (B, N) raw heatmap peak
-            result['kp_confidence'] = kp_confidence
-
-            # Iterative PnP (baseline) - all 7 keypoints
-            kp_3d_cam, pnp_valid, reproj_errors = solve_pnp_batch(uv_2d, kpts_3d_robot, camera_K)
-            result['keypoints_3d_cam'] = kp_3d_cam
-            result['pnp_valid'] = pnp_valid
-            result['reproj_errors'] = reproj_errors
-            # RANSAC EPnP (robust) - all 7 keypoints, auto outlier rejection
-            kp_3d_cam_r, pnp_valid_r, reproj_errors_r, n_inliers_r = solve_pnp_ransac_batch(uv_2d, kpts_3d_robot, camera_K)
-            result['keypoints_3d_cam_ransac'] = kp_3d_cam_r
-            result['pnp_valid_ransac'] = pnp_valid_r
-            result['reproj_errors_ransac'] = reproj_errors_r
-            result['pnp_n_inliers_ransac'] = n_inliers_r
-            # Confidence-filtered RANSAC: drop low-confidence keypoints before PnP
-            kp_3d_cam_cf, pnp_valid_cf, reproj_errors_cf, n_inliers_cf = solve_pnp_conf_batch(
-                uv_2d, kpts_3d_robot, camera_K, kp_confidence, min_kp=4
-            )
-            result['keypoints_3d_cam_conf'] = kp_3d_cam_cf
-            result['pnp_valid_conf'] = pnp_valid_cf
-            result['reproj_errors_conf'] = reproj_errors_cf
-            result['pnp_n_used_conf'] = n_inliers_cf
 
         return result

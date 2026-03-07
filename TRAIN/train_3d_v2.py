@@ -73,13 +73,13 @@ def compute_joint_stats(dataset, num_samples=5000):
 def get_alpha_heatmap(epoch):
     """RoboPEPP-style progressive heatmap loss weighting"""
     if epoch < 5:
-        return 1e-4
-    elif epoch < 10:
+        return 0.0
+    elif epoch < 15:
+        return 1e-3
+    elif epoch < 30:
         return 1e-2
-    elif epoch < 40:
-        return 1e-1
     else:
-        return 1.0
+        return 5e-2  # Keep low to avoid overfitting
 
 
 def generate_gt_heatmaps(keypoints_2d, valid_mask, heatmap_size, sigma=5.0):
@@ -180,12 +180,12 @@ def main(args):
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler,
                             shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
-    # ─── Joint angle statistics ───
+    # ─── Joint angle statistics (hardcoded from DREAM synthetic panda, same as RoboPEPP) ───
+    joint_mean = PANDA_JOINT_MEAN.to(device)
+    joint_std = PANDA_JOINT_STD.to(device)
     if is_main:
-        print("Computing joint angle statistics from training data...")
-    joint_mean, joint_std = compute_joint_stats(train_dataset)
-    joint_mean = joint_mean.to(device)
-    joint_std = joint_std.to(device)
+        print(f"Joint mean: {joint_mean.cpu().tolist()}")
+        print(f"Joint std:  {joint_std.cpu().tolist()}")
 
     # ─── Model ───
     model = DINOv3PoseEstimator(
@@ -231,8 +231,8 @@ def main(args):
     joint_criterion = nn.MSELoss(reduction='none')
     joint_l1 = nn.L1Loss(reduction='none')
 
-    # Per-joint weights
-    joint_weights = torch.tensor([3.0, 1.0, 2.0, 1.0, 2.0, 1.0], device=device)  # 6 joints (joint7 fixed)
+    # Balanced per-joint weights (no extreme values)
+    joint_weights = torch.tensor([1.5, 1.0, 1.0, 1.0, 1.0, 1.0], device=device)
     joint_weights = joint_weights / joint_weights.mean()
 
     if is_main and args.use_wandb:
@@ -254,11 +254,12 @@ def main(args):
         if train_sampler:
             train_sampler.set_epoch(epoch)
 
-        # ─── Phase transition: unfreeze backbone + heatmap head ───
+        # ─── Phase transition: unfreeze backbone ONLY (keep heatmap frozen) ───
         if epoch == args.warmup_frozen_epochs:
             if is_main:
                 print(f"\n{'='*60}")
-                print(f"UNFREEZING backbone (last {args.unfreeze_blocks} blocks) + heatmap head")
+                print(f"UNFREEZING backbone (last {args.unfreeze_blocks} blocks) ONLY")
+                print(f"Heatmap head stays FROZEN to preserve 2D quality")
                 print(f"{'='*60}\n")
 
             # Unfreeze backbone last N blocks
@@ -274,14 +275,9 @@ def main(args):
                     for param in layers[i].parameters():
                         param.requires_grad = True
 
-            # Unfreeze heatmap head
-            for param in raw_model.keypoint_head.parameters():
-                param.requires_grad = True
-
-            # Rebuild optimizer with all trainable params, lower LR for backbone
+            # Rebuild optimizer (heatmap head stays frozen)
             param_groups = [
                 {'params': [p for p in raw_model.joint_angle_head.parameters() if p.requires_grad], 'lr': args.lr},
-                {'params': [p for p in raw_model.keypoint_head.parameters() if p.requires_grad], 'lr': args.lr * 0.1},
                 {'params': [p for n, p in raw_model.backbone.named_parameters() if p.requires_grad], 'lr': args.lr * 0.01},
             ]
             optimizer = optim.AdamW(param_groups, weight_decay=args.weight_decay)
@@ -290,22 +286,25 @@ def main(args):
                 n_train = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
                 print(f"Trainable params after unfreeze: {n_train:,}\n")
 
-        alpha_hm = get_alpha_heatmap(epoch) if epoch >= args.warmup_frozen_epochs else 0.0
+        alpha_hm = 0.0  # Heatmap head completely frozen, no loss
 
         # ─── Train ───
         model.train()
         train_loss_accum = 0.0
         train_joint_mae = np.zeros(6)
         train_count = 0
+        epoch_grad_stats = {}  # accumulate grad stats over epoch
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]") if is_main else train_loader
 
         for batch in pbar:
             # Warmup LR
             if global_step < args.warmup_steps:
-                frac = global_step / args.warmup_steps
-                for pg in optimizer.param_groups:
-                    pg['lr'] = pg.get('lr', args.lr) * frac
+                frac = (global_step + 1) / args.warmup_steps
+                base_lrs = [args.lr, args.lr * 0.1, args.lr * 0.01]
+                for idx, pg in enumerate(optimizer.param_groups):
+                    base = base_lrs[idx] if idx < len(base_lrs) else args.lr
+                    pg['lr'] = base * frac
 
             imgs = batch['image'].to(device)
             gt_angles = batch['angles'].to(device)  # (B, 7)
@@ -321,13 +320,14 @@ def main(args):
             optimizer.zero_grad()
             preds = model(imgs)
 
-            pred_angles = preds['joint_angles'][:, :6]  # (B, 6)
+            pred_angles_norm = preds['joint_angles'][:, :6]  # (B, 6) — model outputs normalized
 
-            # ─── Joint angle loss (normalized space, MSE) ───
-            # Normalize predictions too
-            pred_norm = (pred_angles - joint_mean[:6]) / joint_std[:6]
-            joint_loss_per = joint_criterion(pred_norm, gt_norm)  # (B, 6)
+            # ─── Joint angle loss (normalized space, Huber for robustness) ───
+            joint_loss_per = F.smooth_l1_loss(pred_angles_norm, gt_norm, reduction='none', beta=0.5)  # Huber
             joint_loss = (joint_loss_per * joint_weights.unsqueeze(0)).mean()
+
+            # Denormalize for MAE logging
+            pred_angles = pred_angles_norm * joint_std[:6] + joint_mean[:6]
 
             # ─── Heatmap loss (regularizer) ───
             hm_loss = torch.tensor(0.0, device=device)
@@ -345,6 +345,22 @@ def main(args):
             total_loss = joint_loss + alpha_hm * hm_loss
 
             total_loss.backward()
+
+            # ─── Gradient monitoring (every 100 steps) ───
+            grad_stats = {}
+            if is_main and global_step % 100 == 0:
+                for name, module in [
+                    ('angle_head', raw_model.joint_angle_head),
+                    ('kp_head', raw_model.keypoint_head),
+                    ('backbone', raw_model.backbone),
+                ]:
+                    grads = [p.grad.detach().norm().item() for p in module.parameters() if p.grad is not None]
+                    if grads:
+                        grad_stats[name] = {'mean': np.mean(grads), 'max': np.max(grads), 'n': len(grads)}
+                        if name not in epoch_grad_stats:
+                            epoch_grad_stats[name] = []
+                        epoch_grad_stats[name].append(grad_stats[name]['mean'])
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
             optimizer.step()
 
@@ -359,24 +375,32 @@ def main(args):
 
             if is_main and hasattr(pbar, 'set_postfix_str'):
                 jstr = ' '.join([f'J{j}:{v:.1f}' for j, v in enumerate(train_joint_mae)])
+                grad_str = ''
+                if grad_stats:
+                    grad_str = ' | ' + ' '.join([f'∇{k}={v["mean"]:.1e}' for k, v in grad_stats.items()])
                 pbar.set_postfix_str(
                     f"Lj={joint_loss.item():.4f} Lhm={hm_loss.item():.4f} α={alpha_hm:.0e} "
-                    f"lr={optimizer.param_groups[0]['lr']:.1e} | {jstr}°"
+                    f"lr={optimizer.param_groups[0]['lr']:.1e} | {jstr}°{grad_str}"
                 )
 
             if is_main and args.use_wandb and global_step % 50 == 0:
-                wandb.log({
+                log_dict = {
                     "train/joint_loss": joint_loss.item(),
                     "train/heatmap_loss": hm_loss.item(),
                     "train/total_loss": total_loss.item(),
                     "train/alpha_hm": alpha_hm,
                     "train/lr": optimizer.param_groups[0]['lr'],
-                }, step=global_step)
+                }
+                for name, stats in grad_stats.items():
+                    log_dict[f"grad/{name}_mean"] = stats['mean']
+                    log_dict[f"grad/{name}_max"] = stats['max']
+                wandb.log(log_dict, step=global_step)
 
         # ─── Validation ───
         model.eval()
         val_loss_accum = 0.0
         val_joint_mae = np.zeros(6)
+        val_3d_errors = []  # per-link 3D errors
         val_count = 0
         viz_data = None
         max_val_batches = max(1, int(len(val_loader) * args.val_ratio))
@@ -393,37 +417,34 @@ def main(args):
                 gt_angles_6 = gt_angles[:, :6]
                 gt_norm = (gt_angles_6 - joint_mean[:6]) / joint_std[:6]
 
-                # Scale camera_K for PnP
-                camera_K = batch['camera_K'].to(device)
-                original_size = batch['original_size'].to(device)
-                scale_x = args.heatmap_size / original_size[:, 0]
-                scale_y = args.heatmap_size / original_size[:, 1]
-                camera_K_scaled = camera_K.clone()
-                camera_K_scaled[:, 0, 0] *= scale_x
-                camera_K_scaled[:, 1, 1] *= scale_y
-                camera_K_scaled[:, 0, 2] *= scale_x
-                camera_K_scaled[:, 1, 2] *= scale_y
+                preds = model(imgs)
+                pred_angles_norm = preds['joint_angles'][:, :6]
 
-                preds = model(imgs, camera_K=camera_K_scaled)
-                pred_angles = preds['joint_angles'][:, :6]
-
-                pred_norm = (pred_angles - joint_mean[:6]) / joint_std[:6]
-                joint_loss = (joint_criterion(pred_norm, gt_norm) * joint_weights.unsqueeze(0)).mean()
+                joint_loss = (joint_criterion(pred_angles_norm, gt_norm) * joint_weights.unsqueeze(0)).mean()
                 val_loss_accum += joint_loss.item()
 
-                # Per-joint MAE (degrees) - wrap-aware
+                # Denormalize for MAE
+                pred_angles = pred_angles_norm * joint_std[:6] + joint_mean[:6]
+
+                # Per-joint MAE (degrees)
                 angle_diff = pred_angles - gt_angles_6
-                angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
                 batch_mae = angle_diff.abs().mean(dim=0).cpu().numpy() * (180 / math.pi)
                 val_joint_mae = (val_joint_mae * val_count + batch_mae) / (val_count + 1)
                 val_count += 1
 
+                # 3D keypoint error via FK
+                gt_angles_full = gt_angles.clone()
+                gt_angles_full[:, 6] = 0.0
+                pred_angles_full = torch.zeros_like(gt_angles)
+                pred_angles_full[:, :6] = pred_angles
+                gt_kp_3d = panda_forward_kinematics(gt_angles_full)
+                pred_kp_3d = panda_forward_kinematics(pred_angles_full)
+                per_link_err = (gt_kp_3d - pred_kp_3d).norm(dim=-1)
+                val_3d_errors.append(per_link_err.cpu().numpy())
+
                 # Capture viz data
                 if i == 0 and is_main:
-                    gt_angles_full = gt_angles.clone()
-                    gt_angles_full[:, 6] = 0.0
-                    gt_kp_3d = panda_forward_kinematics(gt_angles_full)
-                    viz_data = (imgs, gt_kp_3d, preds['keypoints_3d_fk'], preds['heatmaps_2d'])
+                    viz_data = (imgs, gt_kp_3d, pred_kp_3d, preds['heatmaps_2d'])
 
         avg_val_loss = val_loss_accum / max_val_batches
 
@@ -440,6 +461,22 @@ def main(args):
             print(f"  {'MEAN':<8} {train_joint_mae.mean():>10.2f}° {val_joint_mae.mean():>10.2f}°")
             worst = np.argmax(val_joint_mae)
             print(f"  → Worst: J{worst} ({val_joint_mae[worst]:.2f}°)")
+            print(f"{'='*60}")
+
+            # 3D keypoint error
+            link_names = ['link0', 'link2', 'link3', 'link4', 'link6', 'link7', 'hand']
+            val_3d = np.concatenate(val_3d_errors, axis=0).mean(axis=0)  # (7,)
+            mean_3d = val_3d.mean()
+            print(f"\n  3D Keypoint Error (val):")
+            for li, ln in enumerate(link_names):
+                print(f"    {ln:<8} {val_3d[li]*1000:.1f}mm")
+            print(f"    {'MEAN':<8} {mean_3d*1000:.1f}mm")
+
+            # Gradient norms (epoch average)
+            if epoch_grad_stats:
+                print(f"\n  Gradient Norms (epoch avg):")
+                for name, vals in epoch_grad_stats.items():
+                    print(f"    ∇{name:<12} mean={np.mean(vals):.2e}  max={np.max(vals):.2e}")
             print(f"{'='*60}\n")
 
             if args.use_wandb:
@@ -452,6 +489,9 @@ def main(args):
                 for j in range(6):
                     log_dict[f"val/J{j}_mae_deg"] = val_joint_mae[j]
                     log_dict[f"train/J{j}_mae_deg"] = train_joint_mae[j]
+                log_dict["val/mean_3d_mm"] = mean_3d * 1000
+                for li, ln in enumerate(link_names):
+                    log_dict[f"val/3d_{ln}_mm"] = val_3d[li] * 1000
                 if viz_data is not None:
                     log_dict["viz/pose"] = visualize_results(*viz_data, num_samples=4)
                 wandb.log(log_dict, step=global_step)
