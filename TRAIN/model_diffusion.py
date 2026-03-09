@@ -25,9 +25,13 @@ class DiffusionAngleHead(nn.Module):
     Condition: UV features from heatmap
     Target: Joint angles (6D)
     """
-    def __init__(self, input_dim=768, num_joints=7, num_angles=6, num_steps=20, dropout=0.1):
+    def __init__(self, input_dim=768, num_joints=7, num_angles=6, num_steps=20,
+                 dropout=0.1, heatmap_size=(512, 512)):
         super().__init__()
         self.num_angles = num_angles
+        self.num_joints = num_joints
+        self.heatmap_size = heatmap_size
+        self.skeleton_edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]
         
         # Time embedding
         time_dim = 128
@@ -38,14 +42,16 @@ class DiffusionAngleHead(nn.Module):
             nn.Linear(time_dim * 4, time_dim)
         )
         
-        # UV encoder (condition)
-        self.uv_encoder = nn.Sequential(
-            nn.Linear(num_joints * 2, 256),
+        skeleton_dim = num_joints * 2 + num_joints * 2 + num_joints + len(self.skeleton_edges) * 2 + len(self.skeleton_edges)
+
+        # 2D skeleton encoder: use the well-trained heatmap geometry as the main signal.
+        self.skeleton_encoder = nn.Sequential(
+            nn.Linear(skeleton_dim, 256),
             nn.GELU(),
             nn.Linear(256, 256)
         )
 
-        self.conf_encoder = nn.Sequential(
+        self.skeleton_weight = nn.Sequential(
             nn.Linear(num_joints, 128),
             nn.GELU(),
             nn.Linear(128, 1),
@@ -84,19 +90,36 @@ class DiffusionAngleHead(nn.Module):
         self.beta_end = 0.02
 
     def encode_condition(self, dino_features, predicted_heatmaps):
-        """Build conditioning features from frozen backbone + heatmaps."""
+        """Build conditioning features from frozen backbone + 2D skeleton geometry."""
         B = dino_features.shape[0]
 
         xf = dino_features.mean(dim=1)  # (B, 768)
         feat_cond = self.feat_encoder(xf)  # (B, 256)
 
         uv = soft_argmax_2d(predicted_heatmaps, temperature=100.0)
-        uv_flat = uv.reshape(B, -1)
-        uv_cond = self.uv_encoder(uv_flat)  # (B, 256)
         conf = predicted_heatmaps.flatten(2).amax(dim=2)
-        uv_cond = uv_cond * self.conf_encoder(conf)
 
-        condition = torch.cat([feat_cond, uv_cond], dim=1)  # (B, 512)
+        H, W = predicted_heatmaps.shape[-2:]
+        uv_norm = uv.clone()
+        uv_norm[..., 0] = (uv_norm[..., 0] / max(W - 1, 1)) * 2.0 - 1.0
+        uv_norm[..., 1] = (uv_norm[..., 1] / max(H - 1, 1)) * 2.0 - 1.0
+
+        root_rel = uv_norm - uv_norm[:, :1]
+        bone_vecs = [uv_norm[:, dst] - uv_norm[:, src] for src, dst in self.skeleton_edges]
+        bone_vecs = torch.stack(bone_vecs, dim=1)
+        bone_lens = bone_vecs.norm(dim=-1, keepdim=False)
+
+        skeleton_feat = torch.cat([
+            uv_norm.reshape(B, -1),
+            root_rel.reshape(B, -1),
+            conf,
+            bone_vecs.reshape(B, -1),
+            bone_lens,
+        ], dim=1)
+        skeleton_cond = self.skeleton_encoder(skeleton_feat)
+        skeleton_cond = skeleton_cond * self.skeleton_weight(conf)
+
+        condition = torch.cat([feat_cond, skeleton_cond], dim=1)  # (B, 512)
         return condition, uv
         
     def forward(self, dino_features, predicted_heatmaps, camera_K=None, training=True):
@@ -192,6 +215,8 @@ class DiffusionAngleHead(nn.Module):
             'noise_loss': noise_loss.detach(),
             'init_loss': init_loss.detach(),
             'recon_loss': recon_loss.detach(),
+            'init_pred': init_pred,
+            'pred_x0': pred_x0,
         }
 
 
@@ -212,6 +237,7 @@ class DINOv3DiffusionPoseEstimator(nn.Module):
             num_angles=6,
             num_steps=diffusion_steps,
             dropout=angle_dropout,
+            heatmap_size=heatmap_size,
         )
     
     def forward(self, image_tensor_batch, camera_K=None, training=True, **kwargs):

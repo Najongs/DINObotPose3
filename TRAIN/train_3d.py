@@ -141,10 +141,11 @@ def visualize_3d_with_2d(images, gt_kp_3d, pred_kp_3d, pred_heatmaps, num_sample
 
 class JointAnglePoseLoss(nn.Module):
     """Loss for Joint Angle prediction mode (sin/cos based)."""
-    def __init__(self, angle_weight=1.0, fk_3d_weight=0.0, fix_joint7=False, compute_pnp_metric=False):
+    def __init__(self, angle_weight=1.0, fk_3d_weight=0.0, bone_loss_weight=100.0, fix_joint7=False, compute_pnp_metric=False):
         super().__init__()
         self.angle_weight = angle_weight
         self.fk_3d_weight = fk_3d_weight
+        self.bone_loss_weight = bone_loss_weight
         self.fix_joint7 = fix_joint7
         self.compute_pnp_metric = compute_pnp_metric
         self.loss_fn = nn.SmoothL1Loss(beta=0.01, reduction='none')
@@ -210,6 +211,31 @@ class JointAnglePoseLoss(nn.Module):
 
             total_loss = total_loss + self.fk_3d_weight * fk_loss
             loss_dict['metric/fk_3d_robot'] = fk_loss.item()
+
+        # 🚀 [추가] Bone Length Loss (Geometric Prior)
+        # Training loop 내에서 직접 정방향 FK 좌표 활용 (predict_kp_robot)
+        if self.bone_loss_weight > 0.0:
+            if 'keypoints_3d_fk' in pred_dict:
+                pred_kp_robot = pred_dict['keypoints_3d_fk']
+            else:
+                pred_angles_fk = pred_dict['joint_angles'].clone()
+                if self.fix_joint7 and pred_angles_fk.shape[1] >= 7:
+                    pred_angles_fk[:, 6] = 0.0
+                pred_kp_robot = panda_forward_kinematics(pred_angles_fk)
+
+            gt_angles_fk = gt_angles.clone()
+            if self.fix_joint7 and gt_angles_fk.shape[1] >= 7:
+                gt_angles_fk[:, 6] = 0.0
+            
+            gt_kp_robot = panda_forward_kinematics(gt_angles_fk)
+            
+            # Compute pair-wise bone lengths
+            pred_bones = torch.norm(pred_kp_robot[:, 1:, :] - pred_kp_robot[:, :-1, :], dim=2)
+            gt_bones = torch.norm(gt_kp_robot[:, 1:, :] - gt_kp_robot[:, :-1, :], dim=2)
+            
+            bone_loss = F.mse_loss(pred_bones, gt_bones)
+            total_loss = total_loss + self.bone_loss_weight * bone_loss
+            loss_dict['loss/bone_length'] = bone_loss.item()
 
         # PnP metric (validation only, no gradient)
         if self.compute_pnp_metric and 'keypoints_3d_cam' in pred_dict and 'keypoints_3d' in gt_dict:
@@ -311,6 +337,7 @@ def main(args):
     criterion = JointAnglePoseLoss(
         angle_weight=args.angle_weight,
         fk_3d_weight=args.fk_3d_weight,
+        bone_loss_weight=args.bone_loss_weight,
         fix_joint7=args.fix_joint7,
         compute_pnp_metric=args.compute_pnp_metric
     ).to(device)
@@ -1002,6 +1029,7 @@ if __name__ == '__main__':
     # 🚀 [개선] Sin/Cos 기반 손실, FK loss 비활성화
     parser.add_argument('--angle-weight', type=float, default=1.0, help='Sin/Cos loss weight')
     parser.add_argument('--fk-3d-weight', type=float, default=0.0, help='FK 3D loss weight (disabled during training, metric only)')
+    parser.add_argument('--bone-loss-weight', type=float, default=100.0, help='Bone length loss weight')
     # Direct 3D mode hyperparameters
     parser.add_argument('--kp-weight', type=float, default=100.0, help='3D keypoint loss weight for direct_3d mode')
     parser.add_argument('--compute-pnp-metric', action='store_true', help='Compute PnP camera-frame metric (diagnostic only, no backprop)')

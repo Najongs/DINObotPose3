@@ -28,7 +28,7 @@ import wandb
 import matplotlib.pyplot as plt
 from PIL import Image
 
-from model import DINOv3PoseEstimator, panda_forward_kinematics, soft_argmax_2d
+from model_v3 import DINOv3PoseEstimator, panda_forward_kinematics, soft_argmax_2d
 from dataset import PoseEstimationDataset
 
 
@@ -68,6 +68,34 @@ def compute_joint_stats(dataset, num_samples=5000):
     for j in range(len(mean)):
         print(f"  Joint {j}: mean={mean[j]:.4f} std={std[j]:.4f}")
     return mean, std
+
+
+def optimize_ik_batch(pred_kp_3d, joint_mean, num_iters=150, lr=5e-2):
+    """
+    Given predicted 3D keypoints (B, 7, 3), solve IK using PyTorch autodiff.
+    Returns optimized joint angles (B, 6).
+    """
+    B = pred_kp_3d.shape[0]
+    device = pred_kp_3d.device
+    
+    # Initialize from joint mean
+    angles = joint_mean[:6].unsqueeze(0).expand(B, 6).clone().to(device)
+    angles.requires_grad = True
+    
+    optimizer = torch.optim.Adam([angles], lr=lr)
+    
+    for _ in range(num_iters):
+        optimizer.zero_grad()
+        
+        angles_full = torch.zeros(B, 7, device=device)
+        angles_full[:, :6] = angles
+        
+        current_kp_3d = panda_forward_kinematics(angles_full)
+        loss = F.mse_loss(current_kp_3d, pred_kp_3d)
+        loss.backward()
+        optimizer.step()
+        
+    return angles.detach()
 
 
 def get_alpha_heatmap(epoch):
@@ -211,7 +239,7 @@ def main(args):
         param.requires_grad = False
     for param in model.keypoint_head.parameters():
         param.requires_grad = False
-    for param in model.joint_angle_head.parameters():
+    for param in model.keypoint_3d_head.parameters():
         param.requires_grad = True
 
     if local_rank != -1:
@@ -219,12 +247,17 @@ def main(args):
 
     raw_model = model.module if hasattr(model, 'module') else model
 
-    # ─── Optimizer (will be rebuilt when unfreezing) ───
+    # ─── Optimizer & Scheduler ───
     def build_optimizer(model_ref, lr):
         params = [p for p in model_ref.parameters() if p.requires_grad]
         return optim.AdamW(params, lr=lr, weight_decay=args.weight_decay)
 
     optimizer = build_optimizer(raw_model, args.lr)
+    
+    # Cosine Annealing LR Scheduler
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs * len(train_loader), eta_min=args.min_lr
+    )
 
     # ─── Loss ───
     heatmap_criterion = nn.MSELoss()
@@ -254,12 +287,12 @@ def main(args):
         if train_sampler:
             train_sampler.set_epoch(epoch)
 
-        # ─── Phase transition: unfreeze backbone ONLY (keep heatmap frozen) ───
+        # ─── Phase transition: unfreeze backbone and heatmap head ───
         if epoch == args.warmup_frozen_epochs:
             if is_main:
                 print(f"\n{'='*60}")
-                print(f"UNFREEZING backbone (last {args.unfreeze_blocks} blocks) ONLY")
-                print(f"Heatmap head stays FROZEN to preserve 2D quality")
+                print(f"UNFREEZING backbone (last {args.unfreeze_blocks} blocks)")
+                print(f"UNFREEZING heatmap head")
                 print(f"{'='*60}\n")
 
             # Unfreeze backbone last N blocks
@@ -275,23 +308,36 @@ def main(args):
                     for param in layers[i].parameters():
                         param.requires_grad = True
 
-            # Rebuild optimizer (heatmap head stays frozen)
+            # Unfreeze heatmap head
+            for param in raw_model.keypoint_head.parameters():
+                param.requires_grad = True
+
+            # Rebuild optimizer and scheduler
             param_groups = [
-                {'params': [p for p in raw_model.joint_angle_head.parameters() if p.requires_grad], 'lr': args.lr},
-                {'params': [p for n, p in raw_model.backbone.named_parameters() if p.requires_grad], 'lr': args.lr * 0.01},
+                {'params': [p for p in raw_model.keypoint_3d_head.parameters() if p.requires_grad], 'initial_lr': args.lr, 'lr': args.lr},
+                {'params': [p for p in raw_model.keypoint_head.parameters() if p.requires_grad], 'initial_lr': args.lr * 0.1, 'lr': args.lr * 0.1},
+                {'params': [p for n, p in raw_model.backbone.named_parameters() if p.requires_grad], 'initial_lr': args.lr * 0.01, 'lr': args.lr * 0.01},
             ]
+            
+            # Retrieve latest lr from old scheduler if needed or just start fresh scheduling phase
+            # For simplicity, we create a new optimizer and scheduler focusing on remaining steps
             optimizer = optim.AdamW(param_groups, weight_decay=args.weight_decay)
+            
+            remaining_steps = (args.epochs - epoch) * len(train_loader)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=remaining_steps, eta_min=args.min_lr
+            )
 
             if is_main:
                 n_train = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
                 print(f"Trainable params after unfreeze: {n_train:,}\n")
 
-        alpha_hm = 0.0  # Heatmap head completely frozen, no loss
+        alpha_hm = get_alpha_heatmap(epoch)
 
         # ─── Train ───
         model.train()
         train_loss_accum = 0.0
-        train_joint_mae = np.zeros(6)
+        train_kp_error = np.zeros(7)
         train_count = 0
         epoch_grad_stats = {}  # accumulate grad stats over epoch
 
@@ -301,10 +347,12 @@ def main(args):
             # Warmup LR
             if global_step < args.warmup_steps:
                 frac = (global_step + 1) / args.warmup_steps
-                base_lrs = [args.lr, args.lr * 0.1, args.lr * 0.01]
+                # Manually adjust according to parameter groups
                 for idx, pg in enumerate(optimizer.param_groups):
-                    base = base_lrs[idx] if idx < len(base_lrs) else args.lr
+                    base = pg.get('initial_lr', args.lr) # Fallback to args.lr if not set
                     pg['lr'] = base * frac
+            else:
+                pass # Handled by scheduler.step() below
 
             imgs = batch['image'].to(device)
             gt_angles = batch['angles'].to(device)  # (B, 7)
@@ -313,21 +361,21 @@ def main(args):
 
             # Fix joint 7 to 0
             gt_angles_6 = gt_angles[:, :6]
-
-            # Normalize GT angles
-            gt_norm = (gt_angles_6 - joint_mean[:6]) / joint_std[:6]
+            gt_angles_full = gt_angles.clone()
+            gt_angles_full[:, 6] = 0.0
+            with torch.no_grad():
+                gt_kp_3d = panda_forward_kinematics(gt_angles_full) # (B, 7, 3)
 
             optimizer.zero_grad()
             preds = model(imgs)
 
-            pred_angles_norm = preds['joint_angles'][:, :6]  # (B, 6) — model outputs normalized
+            pred_kp_3d = preds['keypoints_3d']  # (B, 7, 3)
 
-            # ─── Joint angle loss (normalized space, Huber for robustness) ───
-            joint_loss_per = F.smooth_l1_loss(pred_angles_norm, gt_norm, reduction='none', beta=0.5)  # Huber
-            joint_loss = (joint_loss_per * joint_weights.unsqueeze(0)).mean()
-
-            # Denormalize for MAE logging
-            pred_angles = pred_angles_norm * joint_std[:6] + joint_mean[:6]
+            # ─── 3D Keypoint loss ───
+            kp_weights = torch.tensor([1.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], device=device)
+            kp_weights = kp_weights / kp_weights.mean()
+            kp_loss_per = F.smooth_l1_loss(pred_kp_3d, gt_kp_3d, reduction='none', beta=0.1)
+            kp_loss = (kp_loss_per.mean(dim=-1) * kp_weights.unsqueeze(0)).mean()
 
             # ─── Heatmap loss (regularizer) ───
             hm_loss = torch.tensor(0.0, device=device)
@@ -335,35 +383,17 @@ def main(args):
                 pred_hm = preds['heatmaps_2d']
                 hm_loss = heatmap_criterion(pred_hm, gt_heatmaps)
             elif alpha_hm > 0 and 'keypoints' in batch:
-                # Generate GT heatmaps from 2D keypoints on the fly
-                kp_2d = batch['keypoints'].to(device)  # (B, N, 2)
-                gt_hm = generate_gt_heatmaps(kp_2d, valid_mask,
-                                              (args.heatmap_size, args.heatmap_size), sigma=5.0)
+                kp_2d = batch['keypoints'].to(device)
+                gt_hm = generate_gt_heatmaps(kp_2d, valid_mask, (args.heatmap_size, args.heatmap_size), sigma=5.0)
                 pred_hm = preds['heatmaps_2d']
                 hm_loss = heatmap_criterion(pred_hm, gt_hm)
 
             # ─── Bone Length Loss (Geometric Prior) ───
-            # Use FK to get 3D coords, then compute pair-wise distances (bones)
-            # Bone definitions for panda: 0-1, 1-2, 2-3, 3-4, 4-5, 5-6
-            pred_angles_full = torch.zeros(gt_angles.shape, device=device)
-            pred_angles_full[:, :6] = pred_angles
-            pred_angles_full[:, 6] = 0.0 # fix joint 7
-            
-            gt_angles_full = gt_angles.clone()
-            gt_angles_full[:, 6] = 0.0 # fix joint 7
-            
-            pred_kp_3d = panda_forward_kinematics(pred_angles_full) # (B, 7, 3)
-            gt_kp_3d = panda_forward_kinematics(gt_angles_full)     # (B, 7, 3)
-            
-            # Compute bone lengths (Euclidean distance between adjacent keypoints)
             pred_bones = torch.norm(pred_kp_3d[:, 1:, :] - pred_kp_3d[:, :-1, :], dim=2) # (B, 6)
             gt_bones = torch.norm(gt_kp_3d[:, 1:, :] - gt_kp_3d[:, :-1, :], dim=2)       # (B, 6)
-            
-            # MSE of bone lengths (converted to mm scale roughly for better gradient ranges, or use raw meters)
             bone_loss = F.mse_loss(pred_bones, gt_bones)
             
-            # Total Loss combining Joints + Heatmaps + Bone Lengths
-            total_loss = joint_loss + alpha_hm * hm_loss + args.bone_loss_weight * bone_loss
+            total_loss = kp_loss + alpha_hm * hm_loss + args.bone_loss_weight * bone_loss
 
             total_loss.backward()
 
@@ -371,10 +401,11 @@ def main(args):
             grad_stats = {}
             if is_main and global_step % 100 == 0:
                 for name, module in [
-                    ('angle_head', raw_model.joint_angle_head),
+                    ('kp_3d_head', raw_model.keypoint_3d_head),
                     ('kp_head', raw_model.keypoint_head),
                     ('backbone', raw_model.backbone),
                 ]:
+                    if module is None: continue
                     grads = [p.grad.detach().norm().item() for p in module.parameters() if p.grad is not None]
                     if grads:
                         grad_stats[name] = {'mean': np.mean(grads), 'max': np.max(grads), 'n': len(grads)}
@@ -384,34 +415,37 @@ def main(args):
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
             optimizer.step()
+            
+            if global_step >= args.warmup_steps:
+                scheduler.step()
 
             train_loss_accum += total_loss.item()
             global_step += 1
 
-            # Running joint MAE (degrees)
+            # Running 3D MAE (mm)
             with torch.no_grad():
-                batch_mae = (pred_angles - gt_angles_6).abs().mean(dim=0).cpu().numpy() * (180 / math.pi)
-                train_joint_mae = (train_joint_mae * train_count + batch_mae) / (train_count + 1)
+                batch_kp_err = (pred_kp_3d - gt_kp_3d).norm(dim=-1).mean(dim=0).cpu().numpy() * 1000.0 # mm
+                train_kp_error = (train_kp_error * train_count + batch_kp_err) / (train_count + 1)
                 train_count += 1
 
             if is_main and hasattr(pbar, 'set_postfix_str'):
-                jstr = ' '.join([f'J{j}:{v:.1f}' for j, v in enumerate(train_joint_mae)])
                 grad_str = ''
                 if grad_stats:
                     grad_str = ' | ' + ' '.join([f'∇{k}={v["mean"]:.1e}' for k, v in grad_stats.items()])
                 pbar.set_postfix_str(
-                    f"Lj={joint_loss.item():.4f} Lhm={hm_loss.item():.4f} Lbone={bone_loss.item():.4f} α={alpha_hm:.0e} "
-                    f"lr={optimizer.param_groups[0]['lr']:.1e} | {jstr}°{grad_str}"
+                    f"Lkp={kp_loss.item():.4f} Lhm={hm_loss.item():.4f} Lbone={bone_loss.item():.4f} "
+                    f"Err3d={train_kp_error.mean():.1f}mm" + grad_str
                 )
 
             if is_main and args.use_wandb and global_step % 50 == 0:
                 log_dict = {
-                    "train/joint_loss": joint_loss.item(),
+                    "train/kp_loss": kp_loss.item(),
                     "train/heatmap_loss": hm_loss.item(),
                     "train/bone_loss": bone_loss.item(),
                     "train/total_loss": total_loss.item(),
                     "train/alpha_hm": alpha_hm,
                     "train/lr": optimizer.param_groups[0]['lr'],
+                    "train/mean_3d_err_mm": train_kp_error.mean(),
                 }
                 for name, stats in grad_stats.items():
                     log_dict[f"grad/{name}_mean"] = stats['mean']
@@ -427,42 +461,40 @@ def main(args):
         viz_data = None
         max_val_batches = max(1, int(len(val_loader) * args.val_ratio))
 
-        with torch.no_grad():
-            for i, batch in enumerate(tqdm(val_loader, desc=f"Epoch {epoch} [Val]") if is_main else val_loader):
-                if i >= max_val_batches:
-                    break
+        # We need gradients for IK inside validation! So we shouldn't use no_grad here entirely.
+        for i, batch in enumerate(tqdm(val_loader, desc=f"Epoch {epoch} [Val]") if is_main else val_loader):
+            if i >= max_val_batches:
+                break
 
-                imgs = batch['image'].to(device)
-                gt_angles = batch['angles'].to(device)
-                valid_mask = batch['valid_mask'].to(device)
+            imgs = batch['image'].to(device)
+            gt_angles = batch['angles'].to(device)
+            valid_mask = batch['valid_mask'].to(device)
 
-                gt_angles_6 = gt_angles[:, :6]
-                gt_norm = (gt_angles_6 - joint_mean[:6]) / joint_std[:6]
+            gt_angles_6 = gt_angles[:, :6]
+            gt_angles_full = gt_angles.clone()
+            gt_angles_full[:, 6] = 0.0
 
+            # Forward pass without tracking grad for model
+            with torch.no_grad():
                 preds = model(imgs)
-                pred_angles_norm = preds['joint_angles'][:, :6]
+                pred_kp_3d = preds['keypoints_3d']
+                
+                gt_kp_3d = panda_forward_kinematics(gt_angles_full)
+                val_loss_accum += F.mse_loss(pred_kp_3d, gt_kp_3d).item()
 
-                joint_loss = (joint_criterion(pred_angles_norm, gt_norm) * joint_weights.unsqueeze(0)).mean()
-                val_loss_accum += joint_loss.item()
+                per_link_err = (gt_kp_3d - pred_kp_3d).norm(dim=-1)
+                val_3d_errors.append(per_link_err.cpu().numpy())
 
-                # Denormalize for MAE
-                pred_angles = pred_angles_norm * joint_std[:6] + joint_mean[:6]
+            # ─── IK to get joint angles for evaluation ───
+            # pred_kp_3d is detached because we're not training the model here
+            pred_angles_ik = optimize_ik_batch(pred_kp_3d.detach(), joint_mean, num_iters=150, lr=5e-2)
 
+            with torch.no_grad():
                 # Per-joint MAE (degrees)
-                angle_diff = pred_angles - gt_angles_6
+                angle_diff = pred_angles_ik - gt_angles_6
                 batch_mae = angle_diff.abs().mean(dim=0).cpu().numpy() * (180 / math.pi)
                 val_joint_mae = (val_joint_mae * val_count + batch_mae) / (val_count + 1)
                 val_count += 1
-
-                # 3D keypoint error via FK
-                gt_angles_full = gt_angles.clone()
-                gt_angles_full[:, 6] = 0.0
-                pred_angles_full = torch.zeros_like(gt_angles)
-                pred_angles_full[:, :6] = pred_angles
-                gt_kp_3d = panda_forward_kinematics(gt_angles_full)
-                pred_kp_3d = panda_forward_kinematics(pred_angles_full)
-                per_link_err = (gt_kp_3d - pred_kp_3d).norm(dim=-1)
-                val_3d_errors.append(per_link_err.cpu().numpy())
 
                 # Capture viz data
                 if i == 0 and is_main:
@@ -475,12 +507,12 @@ def main(args):
             print(f"\n{'='*60}")
             print(f"Epoch {epoch} | Val Loss: {avg_val_loss:.4f} | α_hm={alpha_hm:.0e}")
             print(f"{'='*60}")
-            print(f"  {'Joint':<8} {'Train MAE':>12} {'Val MAE':>12}")
-            print(f"  {'-'*8} {'-'*12} {'-'*12}")
+            print(f"  {'Joint':<8} {'IK Val MAE':>12}")
+            print(f"  {'-'*8} {'-'*12}")
             for j in range(6):
                 marker = " ⚠️" if val_joint_mae[j] > 20 else ""
-                print(f"  J{j:<7} {train_joint_mae[j]:>10.2f}° {val_joint_mae[j]:>10.2f}°{marker}")
-            print(f"  {'MEAN':<8} {train_joint_mae.mean():>10.2f}° {val_joint_mae.mean():>10.2f}°")
+                print(f"  J{j:<7} {val_joint_mae[j]:>10.2f}°{marker}")
+            print(f"  {'MEAN':<8} {val_joint_mae.mean():>10.2f}°")
             worst = np.argmax(val_joint_mae)
             print(f"  → Worst: J{worst} ({val_joint_mae[worst]:.2f}°)")
             print(f"{'='*60}")
@@ -509,8 +541,7 @@ def main(args):
                     "epoch": epoch,
                 }
                 for j in range(6):
-                    log_dict[f"val/J{j}_mae_deg"] = val_joint_mae[j]
-                    log_dict[f"train/J{j}_mae_deg"] = train_joint_mae[j]
+                    log_dict[f"val/J{j}_ik_mae_deg"] = val_joint_mae[j]
                 log_dict["val/mean_3d_mm"] = mean_3d * 1000
                 for li, ln in enumerate(link_names):
                     log_dict[f"val/3d_{ln}_mm"] = val_3d[li] * 1000
@@ -543,6 +574,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--min-lr', type=float, default=1e-7)
     parser.add_argument('--weight-decay', type=float, default=1e-5)
     parser.add_argument('--warmup-steps', type=int, default=500)
     parser.add_argument('--grad-clip', type=float, default=1.0)

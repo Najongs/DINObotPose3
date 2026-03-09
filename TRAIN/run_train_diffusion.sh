@@ -36,6 +36,7 @@ DIFFUSION_STEPS=20
 ANGLE_DROPOUT=0.1
 INIT_LOSS_WEIGHT=1.0
 RECON_LOSS_WEIGHT=0.5
+FK_LOSS_WEIGHT=0.1
 
 # Sim-to-real augmentation
 FDA_PROB=0.25
@@ -79,6 +80,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=${NUM_GPUS} train_diffusion.py
     --angle-dropout ${ANGLE_DROPOUT} \
     --init-loss-weight ${INIT_LOSS_WEIGHT} \
     --recon-loss-weight ${RECON_LOSS_WEIGHT} \
+    --fk-loss-weight ${FK_LOSS_WEIGHT} \
     --fda-real-dir "${FDA_REAL_DIR}" \
     --fda-prob ${FDA_PROB} \
     --fda-beta ${FDA_BETA} \

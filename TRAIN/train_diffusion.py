@@ -4,6 +4,7 @@ import argparse
 import random
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -13,6 +14,7 @@ import numpy as np
 
 from model_diffusion import DINOv3DiffusionPoseEstimator
 from dataset import PoseEstimationDataset
+from model import panda_forward_kinematics
 
 # Dataset stats
 PANDA_JOINT_MEAN = torch.tensor([-5.22e-02, 2.68e-01, 6.04e-03, -2.01e+00, 1.49e-02, 1.99e+00, 0.0])
@@ -77,6 +79,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, rank, args, global_
         'noise_loss': 0.0,
         'init_loss': 0.0,
         'recon_loss': 0.0,
+        'fk_loss': 0.0,
     }
     
     if rank == 0:
@@ -121,6 +124,28 @@ def train_epoch(model, dataloader, optimizer, device, epoch, rank, args, global_
                 recon_loss_weight=args.recon_loss_weight,
             )
         loss = loss_dict['loss']
+
+        fk_loss = torch.tensor(0.0, device=device)
+        if args.fk_loss_weight > 0:
+            gt_angles_full = gt_angles.clone()
+            gt_angles_full[:, 6] = 0.0
+
+            init_angles = denormalize_angles(loss_dict['init_pred'])
+            recon_angles = denormalize_angles(loss_dict['pred_x0'])
+
+            init_angles_full = torch.zeros_like(gt_angles)
+            init_angles_full[:, :TRAIN_ANGLE_DIM] = init_angles
+            recon_angles_full = torch.zeros_like(gt_angles)
+            recon_angles_full[:, :TRAIN_ANGLE_DIM] = recon_angles
+
+            gt_kp = panda_forward_kinematics(gt_angles_full)
+            init_kp = panda_forward_kinematics(init_angles_full)
+            recon_kp = panda_forward_kinematics(recon_angles_full)
+
+            fk_init_loss = F.smooth_l1_loss(init_kp, gt_kp, beta=0.02)
+            fk_recon_loss = F.smooth_l1_loss(recon_kp, gt_kp, beta=0.02)
+            fk_loss = 0.5 * (fk_init_loss + fk_recon_loss)
+            loss = loss + args.fk_loss_weight * fk_loss
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
@@ -128,7 +153,10 @@ def train_epoch(model, dataloader, optimizer, device, epoch, rank, args, global_
         global_step += 1
         
         for key in loss_sums:
-            tensor_val = loss_dict[key]
+            if key == 'fk_loss':
+                tensor_val = fk_loss
+            else:
+                tensor_val = loss_dict[key]
             loss_sums[key] += float(tensor_val.detach().item() if torch.is_tensor(tensor_val) else tensor_val)
         if rank == 0:
             pbar.set_postfix({
@@ -136,6 +164,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, rank, args, global_
                 'noise': f'{loss_dict["noise_loss"].item():.4f}',
                 'init': f'{loss_dict["init_loss"].item():.4f}',
                 'recon': f'{loss_dict["recon_loss"].item():.4f}',
+                'fk': f'{fk_loss.item():.4f}',
             })
     
     metrics = {
@@ -210,6 +239,7 @@ def main():
     parser.add_argument('--grad-clip', type=float, default=1.0)
     parser.add_argument('--init-loss-weight', type=float, default=0.5)
     parser.add_argument('--recon-loss-weight', type=float, default=0.5)
+    parser.add_argument('--fk-loss-weight', type=float, default=0.1)
     parser.add_argument('--diffusion-steps', type=int, default=20)
     parser.add_argument('--angle-dropout', type=float, default=0.1)
     parser.add_argument('--no-augment', action='store_true')
@@ -344,6 +374,7 @@ def main():
             print(f"    Noise Loss: {train_metrics['noise_loss']:.4f}")
             print(f"    Init Loss: {train_metrics['init_loss']:.4f}")
             print(f"    Recon Loss: {train_metrics['recon_loss']:.4f}")
+            print(f"    FK Loss: {train_metrics['fk_loss']:.4f}")
             print(f"  Val MAE: {val_mae:.2f}°")
             print(f"  Per-joint (J1-J6): {mae_per_joint}")
             
@@ -353,6 +384,7 @@ def main():
                     'train_noise_loss': train_metrics['noise_loss'],
                     'train_init_loss': train_metrics['init_loss'],
                     'train_recon_loss': train_metrics['recon_loss'],
+                    'train_fk_loss': train_metrics['fk_loss'],
                     'val_mae': val_mae,
                     'epoch': epoch,
                     'global_step': global_step,
