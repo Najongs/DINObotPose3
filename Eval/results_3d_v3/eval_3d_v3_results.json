@@ -1,0 +1,24 @@
+{
+    "dataset": "/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure",
+    "model": "/home/najo/NAS/DIP/DINObotPose3/TRAIN/outputs_3d/train_3d_v3_20260309_154352/best_joint_angle.pth",
+    "mse_loss": 0.009024670289363712,
+    "joint_mae_deg": {
+        "J0": 26.197876739501954,
+        "J1": 8.778351950645444,
+        "J2": 18.20347135066986,
+        "J3": 5.809389770030975,
+        "J4": 17.94402770996094,
+        "J5": 14.021149230003356
+    },
+    "mean_joint_mae_deg": 15.159044458468754,
+    "keypoint_3d_error_mm": {
+        "link0": 3.970155492424965,
+        "link2": 8.2998126745224,
+        "link3": 72.57002592086792,
+        "link4": 70.03608345985413,
+        "link6": 187.45316565036774,
+        "link7": 234.09636318683624,
+        "hand": 228.4310907125473
+    },
+    "mean_keypoint_3d_error_mm": 114.97952789068222
+}
