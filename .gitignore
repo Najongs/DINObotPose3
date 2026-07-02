@@ -17,6 +17,8 @@ eval_outputs*/
 panda-description/
 wandb/
 outputs_heatmap/
+sam3/
+Holistic-Robot-Pose-Estimation/
 
 *.pt
 *.pth

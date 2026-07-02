@@ -119,6 +119,11 @@ class PoseEstimationDataset(Dataset):
         occlusion_max_holes: int = 6,  # Max number of coarse occlusion patches
         occlusion_max_size_frac: float = 0.2,  # Max occluder size relative to image side
         json_allowlist_path: Optional[str] = None,  # Optional list file (txt/json) to keep only selected json frames
+        aug_level: str = "light",  # 'light' (default, legacy) or 'strong' (Stage-1 sim-to-real)
+        norm_mean: Optional[List[float]] = None,  # backbone normalization mean (default ImageNet)
+        norm_std: Optional[List[float]] = None,   # backbone normalization std  (default ImageNet)
+        crop_to_robot: bool = False,  # square-crop around the robot (GT-keypoint bbox) before resize
+        crop_margin: float = 1.5,     # bbox expansion factor (random in [1.3, margin] when augmenting)
     ):
         """
         Args:
@@ -154,8 +159,13 @@ class PoseEstimationDataset(Dataset):
         self.occlusion_prob = occlusion_prob
         self.occlusion_max_holes = max(1, int(occlusion_max_holes))
         self.occlusion_max_size_frac = max(0.01, float(occlusion_max_size_frac))
+        self.crop_to_robot = crop_to_robot
+        self.crop_margin = float(crop_margin)
         self.json_allowlist_path = json_allowlist_path
         self.json_allowlist_keys = self._load_json_allowlist(json_allowlist_path)
+        self.aug_level = aug_level
+        self.norm_mean = norm_mean if norm_mean is not None else [0.485, 0.456, 0.406]
+        self.norm_std = norm_std if norm_std is not None else [0.229, 0.224, 0.225]
 
         # FDA: Load real image paths for style transfer
         self.fda_real_paths = []
@@ -172,14 +182,12 @@ class PoseEstimationDataset(Dataset):
 
         # 이미지 변환 설정
         if normalize:
-            # ImageNet 통계값 사용 (DINOv3가 학습된 방식)
+            # 기본 ImageNet 통계 (DINOv3). SigLIP/SigLIP2는 mean=std=0.5 ([-1,1])를 사용하므로
+            # norm_mean/norm_std로 백본에 맞게 교체 가능.
             self.transform = transforms.Compose([
                 transforms.Resize(image_size),
                 transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
-                )
+                transforms.Normalize(mean=self.norm_mean, std=self.norm_std)
             ])
         else:
             self.transform = transforms.Compose([
@@ -188,8 +196,43 @@ class PoseEstimationDataset(Dataset):
             ])
 
         # 데이터 증강 설정
-        if self.augment:
-            # 🚀 [경량] 학습 수렴 우선 — 최소한의 augmentation
+        if self.augment and self.aug_level == "strong":
+            # 🔥 [강함] Stage-1 sim-to-real: heavy photometric + blur + JPEG + occlusion
+            #     Geometric kept moderate (keypoints are transformed by albumentations).
+            self.augmentation = albu.Compose([
+                # Photometric — close the synthetic→real appearance gap
+                albu.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.6),
+                albu.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=30,
+                                        val_shift_limit=20, p=0.5),
+                albu.RandomGamma(gamma_limit=(70, 130), p=0.3),
+                albu.OneOf([
+                    albu.CLAHE(clip_limit=2.0, p=1.0),
+                    albu.Sharpen(p=1.0),
+                ], p=0.2),
+                # Blur / sensor — real cameras
+                albu.OneOf([
+                    albu.MotionBlur(blur_limit=7, p=1.0),
+                    albu.GaussianBlur(blur_limit=(3, 7), p=1.0),
+                    albu.Defocus(radius=(1, 3), p=1.0),
+                ], p=0.3),
+                albu.GaussNoise(std_range=(0.02, 0.08), p=0.3),
+                albu.ISONoise(p=0.2),
+                albu.ImageCompression(quality_range=(40, 90), p=0.3),
+                # Occlusion — robustness to missing/occluded joints (RoboPEPP-style)
+                albu.CoarseDropout(
+                    num_holes_range=(1, 5),
+                    hole_height_range=(0.05, 0.18),
+                    hole_width_range=(0.05, 0.18),
+                    fill=0,
+                    p=0.5,
+                ),
+                # Geometric — moderate; albumentations re-maps keypoints
+                albu.ShiftScaleRotate(
+                    shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5
+                ),
+            ], keypoint_params=albu.KeypointParams(format='xy', remove_invisible=False))
+        elif self.augment:
+            # 🚀 [경량] 학습 수렴 우선 — 최소한의 augmentation (legacy default)
             self.augmentation = albu.Compose([
                 # 1. 가벼운 노이즈 (강도↓, 확률↓)
                 albu.GaussNoise(std_range=(0.01, 0.03), p=0.15),
@@ -494,31 +537,35 @@ class PoseEstimationDataset(Dataset):
 
     def _create_heatmap(self, keypoints: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
         """
-        Keypoint 위치로부터 Gaussian heatmap 생성 (최적화 버전)
+        Keypoint 위치로부터 Gaussian heatmap 생성 (윈도우 + separable 최적화).
+        sigma가 작아 Gaussian이 키포인트 주변 좁은 영역에만 존재하므로, 전체 HxW가 아니라
+        반경 R 윈도우에서 separable(outer product)로만 계산 -> ~수백배 빠름 (CPU 병목 제거).
         """
         H, W = size
         num_keypoints = len(keypoints)
         heatmaps = np.zeros((num_keypoints, H, W), dtype=np.float32)
 
-        # meshgrid를 한 번만 생성
-        x_range = np.arange(W)
-        y_range = np.arange(H)
-        xx, yy = np.meshgrid(x_range, y_range)
+        sigma = max(self.sigma, 1.0)
+        two_s2 = 2.0 * sigma ** 2
+        # exp(-d2/2σ²) < 0.01  =>  d2 > 2σ²·ln(100); per-axis radius (+1 margin)
+        R = int(np.ceil(sigma * np.sqrt(2.0 * np.log(100.0)))) + 1
 
         for i, (x, y) in enumerate(keypoints):
             # 이미지 범위를 벗어난 키포인트 처리 (Albumentations 이후 대비)
             if x < 0 or y < 0 or x >= W or y >= H:
                 continue
 
-            # Gaussian 생성
-            # sigma가 너무 작으면 학습이 안 되므로 최소값 보장
-            sigma = max(self.sigma, 1.0)
-            d2 = (xx - x) ** 2 + (yy - y) ** 2
-            heatmap = np.exp(-d2 / (2 * sigma ** 2))
-            
-            # 아주 작은 값은 0으로 처리하여 sparsity 확보
-            heatmap[heatmap < 0.01] = 0
-            heatmaps[i] = heatmap
+            xi, yi = int(round(float(x))), int(round(float(y)))
+            x0, x1 = max(0, xi - R), min(W, xi + R + 1)
+            y0, y1 = max(0, yi - R), min(H, yi + R + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            gx = np.exp(-((np.arange(x0, x1) - x) ** 2) / two_s2)  # (w,)
+            gy = np.exp(-((np.arange(y0, y1) - y) ** 2) / two_s2)  # (h,)
+            patch = np.outer(gy, gx).astype(np.float32)            # separable Gaussian
+            patch[patch < 0.01] = 0
+            heatmaps[i, y0:y1, x0:x1] = patch
 
         return heatmaps
 
@@ -535,6 +582,34 @@ class PoseEstimationDataset(Dataset):
         # Keypoint 로드
         keypoints_data = self._load_keypoints_from_json(sample_info['annotation_path'])
         keypoints = keypoints_data['projections'].copy()  # (N, 2) [x, y]
+
+        # Robot-centered SQUARE crop (more pixels on small/foreshortened robots -> better keypoints,
+        # esp. base-yaw J0). Crop around the in-frame GT keypoints + margin; adjust keypoints & K
+        # (principal-point shift). Square -> no aspect distortion. Scale/center jitter when training.
+        if self.crop_to_robot:
+            W0, H0 = original_size
+            inb = ((keypoints[:, 0] >= 0) & (keypoints[:, 0] < W0) &
+                   (keypoints[:, 1] >= 0) & (keypoints[:, 1] < H0))
+            if inb.sum() >= 2:
+                pts = keypoints[inb]
+                cx = (pts[:, 0].min() + pts[:, 0].max()) / 2.0
+                cy = (pts[:, 1].min() + pts[:, 1].max()) / 2.0
+                side = max(pts[:, 0].max() - pts[:, 0].min(), pts[:, 1].max() - pts[:, 1].min())
+                marg = random.uniform(1.3, self.crop_margin) if self.augment else self.crop_margin
+                side = max(side * marg, 16.0)
+                if self.augment:
+                    side *= random.uniform(0.9, 1.1)
+                    cx += random.uniform(-0.1, 0.1) * side
+                    cy += random.uniform(-0.1, 0.1) * side
+                bx0 = int(round(cx - side / 2.0)); by0 = int(round(cy - side / 2.0))
+                bs = int(round(side))
+                image = image.crop((bx0, by0, bx0 + bs, by0 + bs))  # out-of-bounds -> black pad
+                keypoints = keypoints.copy()
+                keypoints[:, 0] -= bx0; keypoints[:, 1] -= by0
+                if 'camera_K' in keypoints_data:
+                    keypoints_data['camera_K'][0, 2] -= bx0
+                    keypoints_data['camera_K'][1, 2] -= by0
+                original_size = (bs, bs)
 
         # FDA augmentation (applied before other augmentations)
         if self.fda_real_paths and random.random() < self.fda_prob:

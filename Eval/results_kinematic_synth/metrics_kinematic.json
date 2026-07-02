@@ -1,0 +1,24 @@
+{
+  "dataset": "../Dataset/Converted_dataset/DREAM_to_DREAM_syn/panda_synth_test_dr",
+  "checkpoint": "../TRAIN/outputs_3d/train_3d_v3_20260309_153945/best_joint_angle.pth",
+  "n_frames": 200,
+  "init_mae_deg_mean6": 24.9003849029541,
+  "joint_mae_deg_per": [
+    24.07691192626953,
+    7.822257041931152,
+    17.09262466430664,
+    12.667625427246094,
+    31.501550674438477,
+    24.9175968170166,
+    63.647064208984375
+  ],
+  "joint_mae_deg_mean6": 19.67976188659668,
+  "add_auc_100mm": 0.4679800000000001,
+  "add_median_mm": 41.53212904930115,
+  "pnp_valid_ratio": 0.755,
+  "kp2d_mean_px": 39.358437959490296,
+  "kp2d_median_px": 1.4790364433067982,
+  "pck5": 0.8342857142857143,
+  "pck10": 0.8821428571428571,
+  "reproj_px_mean": 1256239.5906773424
+}

@@ -309,24 +309,34 @@ class DINOv3Backbone(nn.Module):
         for param in self.model.parameters():
             param.requires_grad = False
             
-        # Unfreeze last N blocks for fine-tuning
+        # Unfreeze last N transformer blocks for fine-tuning.
+        # Locate the encoder layer list across backbones:
+        #   DINOv3:  model.encoder.layers  or  model.blocks
+        #   SigLIP2: model.vision_model.encoder.layers  (nested vision tower)
         if unfreeze_blocks > 0:
-            if hasattr(self.model, "encoder") and hasattr(self.model.encoder, "layers"):
+            layers = None
+            vt = getattr(self.model, "vision_model", self.model)
+            if hasattr(vt, "encoder") and hasattr(vt.encoder, "layers"):
+                layers = vt.encoder.layers
+            elif hasattr(self.model, "encoder") and hasattr(self.model.encoder, "layers"):
                 layers = self.model.encoder.layers
-                for i in range(len(layers) - unfreeze_blocks, len(layers)):
-                    for param in layers[i].parameters():
-                        param.requires_grad = True
             elif hasattr(self.model, "blocks"):
                 layers = self.model.blocks
+            if layers is not None:
                 for i in range(len(layers) - unfreeze_blocks, len(layers)):
                     for param in layers[i].parameters():
                         param.requires_grad = True
+                print(f"  [DINOv3Backbone] unfroze last {unfreeze_blocks}/{len(layers)} blocks")
+            else:
+                print("  [DINOv3Backbone] WARNING: could not locate encoder layers to unfreeze")
 
     def forward(self, image_tensor_batch):
         if "siglip" in self.model_name:
-            outputs = self.model(pixel_values=image_tensor_batch, interpolate_pos_encoding=True)
-            tokens = outputs.last_hidden_state
-            patch_tokens = tokens[:, 1:, :]
+            # SigLIP/SigLIP2 vision tower returns ALL patch tokens, no CLS/register tokens
+            # (verified: siglip2-base-patch16-512 -> (B,1024,768), a perfect 32x32 grid).
+            vt = getattr(self.model, "vision_model", self.model)
+            outputs = vt(pixel_values=image_tensor_batch, interpolate_pos_encoding=True)
+            patch_tokens = outputs.last_hidden_state
         else: # DINOv3 계열
             outputs = self.model(pixel_values=image_tensor_batch)
             tokens = outputs.last_hidden_state

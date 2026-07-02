@@ -243,6 +243,7 @@ def main():
     parser.add_argument('--diffusion-steps', type=int, default=20)
     parser.add_argument('--angle-dropout', type=float, default=0.1)
     parser.add_argument('--no-augment', action='store_true')
+    parser.add_argument('--aug-level', type=str, default='light', choices=['light', 'strong'])
     parser.add_argument('--fda-real-dir', type=str, default=None)
     parser.add_argument('--fda-prob', type=float, default=0.0)
     parser.add_argument('--fda-beta', type=float, default=0.01)
@@ -283,6 +284,7 @@ def main():
         image_size=(args.image_size, args.image_size),
         heatmap_size=(args.heatmap_size, args.heatmap_size),
         augment=not args.no_augment,
+        aug_level=args.aug_level,
         fda_real_dir=args.fda_real_dir,
         fda_prob=args.fda_prob,
         fda_beta=args.fda_beta,

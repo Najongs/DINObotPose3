@@ -1,24 +1,24 @@
 #!/bin/bash
 
 # Configuration
-export CUDA_VISIBLE_DEVICES="0,1,2,3,4"
+export CUDA_VISIBLE_DEVICES="0,1,2"
 NUM_GPUS=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 echo "Using $NUM_GPUS GPUs"
 
 timestamp=$(date +%Y%m%d_%H%M%S)
 
 # Output directories
-BASE_OUTPUT_DIR="/home/najo/NAS/DIP/DINObotPose3/TRAIN/outputs_3d_v4"
+BASE_OUTPUT_DIR="/data/public/NAS/DINObotPose3/TRAIN/outputs_3d_v4"
 OUTPUT_DIR="${BASE_OUTPUT_DIR}/train_3d_v4_${timestamp}"
 LOG_FILE="${OUTPUT_DIR}/train.log"
 
 # Dataset
-DATA_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset"
+DATA_DIR="/data/public/NAS/DINObotPose3/Dataset/Converted_dataset"
 TRAIN_DIR="${DATA_DIR}/DREAM_to_DREAM_syn/panda_synth_train_dr"
 VAL_DIR="${DATA_DIR}/DREAM_to_DREAM_syn/panda_synth_test_dr"
 
 # Pretrained checkpoint (2D heatmap model)
-PRETRAIN_CKPT="/home/najo/NAS/DIP/DINObotPose3/TRAIN/outputs_heatmap/*finetune_no_fda_with_occ_beta0.001_occ0.35_20260305_134104/best_heatmap.pth"
+PRETRAIN_CKPT="/data/public/NAS/DINObotPose3/TRAIN/outputs_heatmap/best_heatmap.pth"
 
 # Model configuration
 MODEL_NAME="facebook/dinov3-vitb16-pretrain-lvd1689m"
@@ -26,7 +26,7 @@ IMAGE_SIZE=512
 HEATMAP_SIZE=512
 
 # Training hyperparameters
-BATCH_SIZE=16            # per GPU
+BATCH_SIZE=8            # per GPU
 EPOCHS=100
 LR=1e-4
 WEIGHT_DECAY=1e-5
@@ -40,7 +40,7 @@ UNFREEZE_BLOCKS=2        # Same as RoboPEPP (last 2 layers of backbone)
 WARMUP_FROZEN_EPOCHS=0   # Let's unfreeze from the start or keep 5
 
 # Dataloader
-NUM_WORKERS=32
+NUM_WORKERS=4
 OCCLUSION_PROB=0.5
 OCCLUSION_SIZE=0.3
 VAL_RATIO=0.2

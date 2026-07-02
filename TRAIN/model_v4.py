@@ -294,10 +294,32 @@ def soft_argmax_2d(heatmaps, temperature=100.0):
     weights = F.softmax(heatmaps_flat * temperature, dim=-1)
     weights = weights.reshape(B, N, H, W)
 
-    x = (weights.sum(dim=2) * x_coords).sum(dim=-1)  
-    y = (weights.sum(dim=3) * y_coords).sum(dim=-1)  
+    x = (weights.sum(dim=2) * x_coords).sum(dim=-1)
+    y = (weights.sum(dim=3) * y_coords).sum(dim=-1)
 
     return torch.stack([x, y], dim=-1)  # (B, N, 2)
+
+
+def windowed_soft_argmax_2d(heatmaps, temperature=100.0, win=15):
+    """Soft-argmax restricted to a ±win px box around the hard-argmax peak. Robust to distractor
+    second-modes that pull the GLOBAL soft-argmax far off (diagnosed: global base 2D mean 101px /
+    p90 229px from distractor mass; windowed -> 5.6px). Same sub-pixel precision near the peak."""
+    B, N, H, W = heatmaps.shape
+    device = heatmaps.device
+    flat = heatmaps.reshape(B, N, -1)
+    idx = flat.argmax(-1)
+    px = (idx % W).float(); py = (idx // W).float()                     # (B,N) hard peak
+    xs = torch.arange(W, device=device, dtype=torch.float32)
+    ys = torch.arange(H, device=device, dtype=torch.float32)
+    yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+    xx = xx.reshape(-1); yy = yy.reshape(-1)                            # (HW,)
+    inwin = ((xx[None, None] - px[..., None]).abs() <= win) & \
+            ((yy[None, None] - py[..., None]).abs() <= win)             # (B,N,HW)
+    if isinstance(temperature, torch.Tensor):
+        temperature = temperature.clamp(min=1.0, max=1000.0)
+    w = F.softmax(flat.masked_fill(~inwin, -1e4) * temperature, dim=-1)
+    x = (w * xx[None, None]).sum(-1); y = (w * yy[None, None]).sum(-1)
+    return torch.stack([x, y], dim=-1)
 
 class DINOv3Backbone(nn.Module):
     def __init__(self, model_name, unfreeze_blocks=2):
@@ -324,9 +346,11 @@ class DINOv3Backbone(nn.Module):
 
     def forward(self, image_tensor_batch):
         if "siglip" in self.model_name:
-            outputs = self.model(pixel_values=image_tensor_batch, interpolate_pos_encoding=True)
-            tokens = outputs.last_hidden_state
-            patch_tokens = tokens[:, 1:, :]
+            # SigLIP/SigLIP2 vision tower returns ALL patch tokens, no CLS/register tokens
+            # (verified: siglip2-base-patch16-512 -> (B,1024,768), a perfect 32x32 grid).
+            vt = getattr(self.model, "vision_model", self.model)
+            outputs = vt(pixel_values=image_tensor_batch, interpolate_pos_encoding=True)
+            patch_tokens = outputs.last_hidden_state
         else: # DINOv3 계열
             outputs = self.model(pixel_values=image_tensor_batch)
             tokens = outputs.last_hidden_state

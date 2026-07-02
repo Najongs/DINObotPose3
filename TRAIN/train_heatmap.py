@@ -91,7 +91,10 @@ class HeatmapModel(nn.Module):
     def __init__(self, model_name, heatmap_size, unfreeze_blocks=2):
         super().__init__()
         self.backbone = DINOv3Backbone(model_name, unfreeze_blocks=unfreeze_blocks)
-        if "siglip" in model_name: feature_dim = self.backbone.model.config.hidden_size
+        if "siglip" in model_name:
+            cfg = self.backbone.model.config
+            vcfg = getattr(cfg, "vision_config", cfg)  # Siglip2Model -> vision_config.hidden_size
+            feature_dim = vcfg.hidden_size
         else:
             config = self.backbone.model.config
             feature_dim = config.hidden_sizes[-1] if "conv" in model_name else config.hidden_size
@@ -118,18 +121,29 @@ def main(args):
     random.seed(args.seed + rank); np.random.seed(args.seed + rank); torch.manual_seed(args.seed + rank)
 
     keypoint_names = ['link0', 'link2', 'link3', 'link4', 'link6', 'link7', 'hand']
+    # SigLIP/SigLIP2 expect mean=std=0.5 ([-1,1]); DINOv3 uses ImageNet stats.
+    if "siglip" in args.model_name:
+        norm_mean, norm_std = [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
+        if is_main:
+            print("==> SigLIP backbone detected: using mean=std=0.5 normalization")
+    else:
+        norm_mean = norm_std = None  # dataset default = ImageNet
     full_train_dataset = PoseEstimationDataset(
         data_dir=args.data_dir[0], keypoint_names=keypoint_names,
         image_size=(args.image_size, args.image_size), heatmap_size=(args.heatmap_size, args.heatmap_size),
         augment=not args.no_augment, fda_real_dir=args.fda_real_dir, fda_prob=args.fda_prob, fda_beta=args.fda_beta,
         occlusion_prob=args.occlusion_prob, occlusion_max_size_frac=args.occlusion_size,
+        aug_level=args.aug_level,
+        norm_mean=norm_mean, norm_std=norm_std,
+        crop_to_robot=args.crop_to_robot, crop_margin=args.crop_margin,
         sigma=2.5
     )
     if args.val_dir:
         val_dataset = PoseEstimationDataset(
             data_dir=args.val_dir, keypoint_names=keypoint_names,
             image_size=(args.image_size, args.image_size), heatmap_size=(args.heatmap_size, args.heatmap_size),
-            augment=False, sigma=2.5
+            augment=False, norm_mean=norm_mean, norm_std=norm_std,
+            crop_to_robot=args.crop_to_robot, crop_margin=args.crop_margin, sigma=2.5
         )
         train_dataset = full_train_dataset
     else:
@@ -178,7 +192,20 @@ def main(args):
     joint_weights = torch.tensor([2.5, 1.5, 1.3, 1.0, 1.3, 1.5, 2.5]).to(device)
     criterion = nn.MSELoss(reduction='none')
     loss_scale = 1000.0
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate, weight_decay=args.weight_decay)
+    # Two LR groups: head at --learning-rate, unfrozen backbone blocks at --backbone-lr (lower).
+    backbone_params, head_params = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        (backbone_params if '.backbone.' in n or n.startswith('backbone.') else head_params).append(p)
+    bb_lr = args.backbone_lr if args.backbone_lr is not None else args.learning_rate
+    param_groups = [{'params': head_params, 'lr': args.learning_rate}]
+    if backbone_params:
+        param_groups.append({'params': backbone_params, 'lr': bb_lr})
+        if is_main:
+            print(f"==> Optimizer: {len(head_params)} head tensors @ lr={args.learning_rate}, "
+                  f"{len(backbone_params)} backbone tensors @ lr={bb_lr}")
+    optimizer = optim.AdamW(param_groups, lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
 
     if is_main:
@@ -266,13 +293,17 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--learning-rate', type=float, default=1e-4)
+    parser.add_argument('--backbone-lr', type=float, default=None, help='LR for unfrozen backbone blocks (default = learning-rate)')
     parser.add_argument('--min-lr', type=float, default=1e-7)
     parser.add_argument('--weight-decay', type=float, default=1e-5)
     parser.add_argument('--unfreeze-blocks', type=int, default=2)
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--no-augment', action='store_true', help='Disable general data augmentation')
+    parser.add_argument('--aug-level', type=str, default='light', choices=['light', 'strong'], help='Augmentation strength (strong = Stage-1 sim-to-real)')
     parser.add_argument('--occlusion-prob', type=float, default=0.5, help='Probability of occlusion augmentation')
     parser.add_argument('--occlusion-size', type=float, default=0.2, help='Max size of occlusion patch relative to image')
+    parser.add_argument('--crop-to-robot', action='store_true', help='square-crop around robot (GT-kp bbox) before resize')
+    parser.add_argument('--crop-margin', type=float, default=1.5, help='bbox expansion factor for crop')
     parser.add_argument('--fda-real-dir', type=str, default=None)
     parser.add_argument('--fda-prob', type=float, default=0.0)
     parser.add_argument('--fda-beta', type=float, default=0.05)
