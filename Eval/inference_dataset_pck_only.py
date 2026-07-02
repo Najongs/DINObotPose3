@@ -134,9 +134,6 @@ def run_inference(args):
         dino_model_name=model_name,
         heatmap_size=(heatmap_size, heatmap_size),
         unfreeze_blocks=0,
-        use_joint_embedding=use_joint_embedding,
-        use_iterative_refinement=False,
-        refinement_iterations=0,
         fix_joint7_zero=fix_joint7_zero,
     ).to(device)
 
