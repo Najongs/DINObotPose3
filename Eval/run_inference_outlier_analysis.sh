@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Model and dataset
-MODEL_PATH="/home/najo/NAS/DIP/DINObotPose3/TRAIN/outputs/dinov3_base_20260303_163439_0.001/best_model.pth"
+MODEL_PATH="/home/najo/NAS/DIP/DINObotPose3/TRAIN/outputs_heatmap/*finetune_no_fda_with_occ_beta0.001_occ0.35_20260305_134104/best_heatmap.pth"
 DATASET_DIR="/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_azure"
 # DATASET_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_kinect360"
 # DATASET_DIR="/data/public/NAS/DINObotPose2/Dataset/Converted_dataset/DREAM_to_DREAM/panda-3cam_realsense"
@@ -37,8 +37,8 @@ OUTLIER_TOPK=200
 
 # Execution mode
 INFER_MODE="multi_gpu"
-NUM_GPUS=3
-GPU_IDS="0,1,2"
+NUM_GPUS=5
+GPU_IDS="0,1,2,3,4"
 
 if [ "${INFER_MODE}" = "single_gpu" ]; then
     echo "Running single-GPU outlier analysis..."

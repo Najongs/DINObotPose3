@@ -143,6 +143,7 @@ def get_camera_extrinsics(gt_kp_2d, gt_kp_3d_robot, camera_K, valid_mask):
     device = gt_kp_2d.device
     R_mats = []
     T_vecs = []
+    pnp_valid = []
 
     for b in range(B):
         pts2d = gt_kp_2d[b].detach().cpu().numpy().astype(np.float64)
@@ -152,24 +153,43 @@ def get_camera_extrinsics(gt_kp_2d, gt_kp_3d_robot, camera_K, valid_mask):
 
         pts2d_valid = pts2d[mask]
         pts3d_valid = pts3d[mask]
+        valid = False
 
         if len(pts2d_valid) >= 4:
-            success, rvec, tvec = cv2.solvePnP(
-                pts3d_valid, pts2d_valid, K, None, flags=cv2.SOLVEPNP_ITERATIVE
-            )
-            if success:
-                R, _ = cv2.Rodrigues(rvec)
-                R_mats.append(torch.from_numpy(R).float().to(device))
-                T_vecs.append(torch.from_numpy(tvec).float().to(device))
-                continue
+            # Choose flags based on point count to avoid DLT errors
+            if len(pts2d_valid) == 4:
+                pnp_flags = cv2.SOLVEPNP_P3P
+            elif len(pts2d_valid) == 5:
+                pnp_flags = cv2.SOLVEPNP_EPNP
+            else:
+                pnp_flags = cv2.SOLVEPNP_ITERATIVE
+                
+            try:
+                success, rvec, tvec = cv2.solvePnP(
+                    pts3d_valid, pts2d_valid, K, None, flags=pnp_flags
+                )
+                if success:
+                    # Guard against OpenCV returning NaNs silently
+                    if not np.isnan(rvec).any() and not np.isnan(tvec).any():
+                        R, _ = cv2.Rodrigues(rvec)
+                        if not np.isnan(R).any():
+                            R_mats.append(torch.from_numpy(R).float().to(device))
+                            T_vecs.append(torch.from_numpy(tvec).float().to(device))
+                            valid = True
+            except Exception as e:
+                pass
         
-        # Fallback to Identity if PnP fails (should be very rare for GT data)
-        R_mats.append(torch.eye(3, device=device))
-        T_vecs.append(torch.zeros((3, 1), device=device))
+        if not valid:
+            # Fallback to Identity if PnP fails or coordinates are NaN
+            R_mats.append(torch.eye(3, device=device))
+            T_vecs.append(torch.zeros((3, 1), device=device))
+            
+        pnp_valid.append(valid)
 
     R_batch = torch.stack(R_mats, dim=0)  # (B, 3, 3)
     T_batch = torch.stack(T_vecs, dim=0).squeeze(-1)  # (B, 3)
-    return R_batch, T_batch
+    pnp_valid_batch = torch.tensor(pnp_valid, device=device, dtype=torch.bool)
+    return R_batch, T_batch, pnp_valid_batch
 
 
 def project_3d_to_2d(points_3d, R, T, K):
@@ -189,7 +209,7 @@ def project_3d_to_2d(points_3d, R, T, K):
     pts_img_homo = torch.bmm(pts_cam, K.transpose(1, 2))  # (B, N, 3)
     
     # 3. Perspective divide
-    z = pts_img_homo[..., 2:3].clamp(min=1e-6)
+    z = pts_img_homo[..., 2:3].clamp(min=0.1)
     uv = pts_img_homo[..., :2] / z
     return uv
 
@@ -316,7 +336,7 @@ def main(args):
     # ─── Loss ───
     heatmap_criterion = nn.MSELoss()
     joint_criterion = nn.MSELoss(reduction='none')
-    reproj_criterion = nn.L1Loss(reduction='none')
+    reproj_criterion = nn.L1Loss(reduction='none') # Normalized L1
 
     # Balanced per-joint weights
     joint_weights = torch.tensor([1.5, 1.0, 1.0, 1.0, 1.0, 1.0], device=device)
@@ -428,14 +448,25 @@ def main(args):
             # ─── 3. 2D Reprojection Loss (⭐ KEY ELEMENT FOR V4 ⭐) ───
             # Solve PnP for Ground Truth to find Extrinsics
             with torch.no_grad():
-                gt_R, gt_T = get_camera_extrinsics(gt_kp_2d, gt_kp_3d, scaled_K, valid_mask)
+                gt_R, gt_T, pnp_valid = get_camera_extrinsics(gt_kp_2d, gt_kp_3d, scaled_K, valid_mask)
             
             # Project PREDICTED 3D points onto 2D image plane using the GT camera extrinsics
             pred_kp_2d_proj = project_3d_to_2d(pred_kp_3d, gt_R, gt_T, scaled_K) # (B, N, 2)
 
+            # Normalize coordinates to [0, 1] to keep reprojection loss scale highly stable
+            norm_pred_2d = pred_kp_2d_proj / args.heatmap_size
+            norm_gt_2d = gt_kp_2d / args.heatmap_size
+
             # Compute pixel loss against GT 2D points, masking out occluded/invalid ones
-            reproj_diff = reproj_criterion(pred_kp_2d_proj, gt_kp_2d).mean(dim=2) # (B, N)
-            reproj_loss = (reproj_diff * valid_mask.float()).sum() / (valid_mask.float().sum() + 1e-6)
+            reproj_diff = reproj_criterion(norm_pred_2d, norm_gt_2d).mean(dim=2) # (B, N)
+            
+            # Combine point valid mask with batch pnp_valid mask
+            final_mask = valid_mask.float() * pnp_valid.unsqueeze(1).float()
+            
+            if final_mask.sum() > 0:
+                reproj_loss = (reproj_diff * final_mask).sum() / (final_mask.sum() + 1e-6)
+            else:
+                reproj_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
             total_loss = joint_loss + args.fk_loss_weight * fk_loss + w_reproj * reproj_loss
 
@@ -541,10 +572,12 @@ def main(args):
                 val_3d_errors.append(per_link_err.cpu().numpy())
 
                 # Validate Reprojection
-                gt_R, gt_T = get_camera_extrinsics(gt_kp_2d, gt_kp_3d, scaled_K, valid_mask)
+                gt_R, gt_T, pnp_valid = get_camera_extrinsics(gt_kp_2d, gt_kp_3d, scaled_K, valid_mask)
                 pred_kp_2d_proj = project_3d_to_2d(pred_kp_3d, gt_R, gt_T, scaled_K) # (B, N, 2)
                 per_link_reproj_err = (pred_kp_2d_proj - gt_kp_2d).norm(dim=-1) # (B, N)
-                val_reproj_errors.append(per_link_reproj_err.cpu().numpy())
+                for b in range(imgs.shape[0]):
+                    if pnp_valid[b]:
+                        val_reproj_errors.append(per_link_reproj_err[b:b+1].cpu().numpy())
 
                 # Capture viz data
                 if i == 0 and is_main:
@@ -570,8 +603,12 @@ def main(args):
             link_names = ['link0', 'link2', 'link3', 'link4', 'link6', 'link7', 'hand']
             val_3d = np.concatenate(val_3d_errors, axis=0).mean(axis=0)  # (7,)
             mean_3d = val_3d.mean()
-            val_reproj = np.concatenate(val_reproj_errors, axis=0).mean(axis=0) # (7,)
-            mean_reproj = val_reproj.mean()
+            if len(val_reproj_errors) > 0:
+                val_reproj = np.concatenate(val_reproj_errors, axis=0).mean(axis=0) # (7,)
+                mean_reproj = val_reproj.mean()
+            else:
+                val_reproj = np.zeros(7)
+                mean_reproj = 0.0
 
             print(f"\n  3D FK Error (val):")
             for li, ln in enumerate(link_names):

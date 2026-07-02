@@ -32,6 +32,11 @@ def load_annotation(json_path, keypoint_names):
     camera_K = None
     if 'meta' in data:
         raw_path = data['meta'].get('image_path', "")
+        
+        # Resolve path
+        if raw_path.startswith('../dataset/'):
+            raw_path = raw_path.replace('../dataset/', '../../../', 1)
+
         json_dir = os.path.dirname(os.path.abspath(json_path))
 
         if not os.path.isabs(raw_path):
@@ -127,7 +132,21 @@ def run_inference(args):
     # 6. Extract Results
     pred_heatmaps = outputs["heatmaps_2d"]
     pred_angles = outputs["joint_angles"][0].cpu().numpy()
-    pred_3d_robot = outputs["keypoints_3d_robot"][0].cpu().numpy()
+    
+    # Compatibility: Compute keypoints_3d_robot if missing
+    if "keypoints_3d_robot" in outputs:
+        pred_3d_robot = outputs["keypoints_3d_robot"][0].cpu().numpy()
+    else:
+        # Re-construct 7-joint vector if needed for FK
+        joint_angles_tensor = outputs["joint_angles"]
+        if args.fix_joint7 and joint_angles_tensor.shape[1] == 6:
+            zeros = torch.zeros(1, 1, device=joint_angles_tensor.device)
+            joint_angles_7 = torch.cat([joint_angles_tensor, zeros], dim=1)
+        else:
+            joint_angles_7 = joint_angles_tensor
+            
+        pred_3d_robot_tensor = panda_forward_kinematics(joint_angles_7)
+        pred_3d_robot = pred_3d_robot_tensor[0].cpu().numpy()
 
     # 2D keypoints via soft_argmax (not argmax)
     pred_2d_hm = soft_argmax_2d(pred_heatmaps)[0].cpu().numpy()  # (N, 2) in heatmap space
@@ -214,7 +233,7 @@ def run_inference(args):
             cv2.circle(img_cv, (int(pred_2d_orig[i, 0]), int(pred_2d_orig[i, 1])), 4, (0, 0, 255), -1)
             cv2.putText(img_cv, keypoint_names[i].split('_')[-1],
                         (int(pred_2d_orig[i, 0]) + 5, int(pred_2d_orig[i, 1])),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
 
         out_file = os.path.join(args.output_dir, "inference_overlay.png")
         cv2.imwrite(out_file, img_cv)

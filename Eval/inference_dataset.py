@@ -1060,9 +1060,6 @@ def run_inference(args):
         dino_model_name=model_name,
         heatmap_size=(heatmap_size, heatmap_size),
         unfreeze_blocks=0,  # Not needed for inference
-        use_joint_embedding=use_joint_embedding,
-        use_iterative_refinement=use_iterative_refinement,
-        refinement_iterations=refinement_iterations,
         fix_joint7_zero=fix_joint7_zero,
     ).to(device)
 
@@ -1533,12 +1530,17 @@ def run_inference(args):
                 (all_kp_projs_gt[:, :, 1] >= 0.0) & (all_kp_projs_gt[:, :, 1] <= raw_resolution[1])
             )
             per_kp_err = np.linalg.norm(all_pred_3d - all_kp_pos_gt, axis=2)  # (N, num_kp)
+            per_kp_2d_err = np.linalg.norm(all_kp_projs_detected - all_kp_projs_gt, axis=2)  # (N, num_kp)
 
             frame_reports = []
             for i in range(n_samples):
                 valid_i = valid_mask[i]
                 errs_i = per_kp_err[i]
+                errs_2d_i = per_kp_2d_err[i]
+                
                 valid_errs_i = errs_i[valid_i]
+                valid_errs_2d_i = errs_2d_i[valid_i]
+
                 if valid_errs_i.size > 0:
                     mean_err = float(np.mean(valid_errs_i))
                     median_err = float(np.median(valid_errs_i))
@@ -1554,9 +1556,20 @@ def run_inference(args):
                     worst_kp_idx = -1
                     worst_kp_name = None
 
+                if valid_errs_2d_i.size > 0:
+                    mean_2d_err = float(np.mean(valid_errs_2d_i))
+                    median_2d_err = float(np.median(valid_errs_2d_i))
+                    max_2d_err = float(np.max(valid_errs_2d_i))
+                else:
+                    mean_2d_err = float('nan')
+                    median_2d_err = float('nan')
+                    max_2d_err = float('nan')
+
                 per_kp_dict = {}
+                per_kp_2d_dict = {}
                 for k_idx, k_name in enumerate(keypoint_names):
                     per_kp_dict[k_name] = float(errs_i[k_idx]) if valid_i[k_idx] else None
+                    per_kp_2d_dict[k_name] = float(errs_2d_i[k_idx]) if valid_i[k_idx] else None
 
                 frame_name = all_frame_names[i] if i < len(all_frame_names) else f"{i:06d}"
                 frame_reports.append({
@@ -1571,22 +1584,33 @@ def run_inference(args):
                     'worst_keypoint_name': worst_kp_name,
                     'worst_keypoint_index': worst_kp_idx,
                     'per_keypoint_error_m': per_kp_dict,
+                    'mean_2d_error_px': mean_2d_err,
+                    'median_2d_error_px': median_2d_err,
+                    'max_2d_error_px': max_2d_err,
+                    'per_keypoint_error_px': per_kp_2d_dict,
                 })
 
-            # Sort by mean error (descending), NaN goes last
-            frame_reports_sorted = sorted(
+            # Sort by mean 3D error (descending), NaN goes last
+            frame_reports_sorted_3d = sorted(
                 frame_reports,
                 key=lambda x: (np.isnan(x['mean_3d_error_m']), -x['mean_3d_error_m'] if not np.isnan(x['mean_3d_error_m']) else 0.0)
             )
+            # Sort by mean 2D error (descending), NaN goes last
+            frame_reports_sorted_2d = sorted(
+                frame_reports,
+                key=lambda x: (np.isnan(x['mean_2d_error_px']), -x['mean_2d_error_px'] if not np.isnan(x['mean_2d_error_px']) else 0.0)
+            )
 
             topk = max(1, int(args.outlier_topk))
-            topk_reports = frame_reports_sorted[:topk]
+            topk_3d_reports = frame_reports_sorted_3d[:topk]
+            topk_2d_reports = frame_reports_sorted_2d[:topk]
 
             # Per-keypoint summary across valid points
             kp_summary = {}
             for k_idx, k_name in enumerate(keypoint_names):
                 kp_valid = valid_mask[:, k_idx]
                 kp_errs = per_kp_err[:, k_idx][kp_valid]
+                kp_errs_2d = per_kp_2d_err[:, k_idx][kp_valid]
                 if kp_errs.size > 0:
                     kp_summary[k_name] = {
                         'count': int(kp_errs.size),
@@ -1595,6 +1619,11 @@ def run_inference(args):
                         'p90_m': float(np.percentile(kp_errs, 90)),
                         'p95_m': float(np.percentile(kp_errs, 95)),
                         'max_m': float(np.max(kp_errs)),
+                        'mean_2d_px': float(np.mean(kp_errs_2d)),
+                        'median_2d_px': float(np.median(kp_errs_2d)),
+                        'p90_2d_px': float(np.percentile(kp_errs_2d, 90)),
+                        'p95_2d_px': float(np.percentile(kp_errs_2d, 95)),
+                        'max_2d_px': float(np.max(kp_errs_2d)),
                     }
                 else:
                     kp_summary[k_name] = {
@@ -1604,36 +1633,63 @@ def run_inference(args):
                         'p90_m': None,
                         'p95_m': None,
                         'max_m': None,
+                        'mean_2d_px': None,
+                        'median_2d_px': None,
+                        'p90_2d_px': None,
+                        'p95_2d_px': None,
+                        'max_2d_px': None,
                     }
 
-            per_frame_path = output_dir / 'per_frame_3d_errors.json'
-            outlier_topk_path = output_dir / 'outlier_topk_3d_errors.json'
-            kp_summary_path = output_dir / 'per_keypoint_3d_error_summary.json'
-            outlier_topk_json_names_txt = output_dir / 'outlier_topk_json_names.txt'
-            outlier_topk_json_paths_txt = output_dir / 'outlier_topk_json_paths.txt'
+            per_frame_path = output_dir / 'per_frame_errors_all.json'
+            outlier_topk_3d_path = output_dir / 'outlier_topk_3d_errors.json'
+            outlier_topk_2d_path = output_dir / 'outlier_topk_2d_errors.json'
+            kp_summary_path = output_dir / 'per_keypoint_error_summary.json'
+            
+            # 3D list files
+            outlier_topk_json_names_txt = output_dir / 'outlier_topk_3d_json_names.txt'
+            outlier_topk_json_paths_txt = output_dir / 'outlier_topk_3d_json_paths.txt'
+            
+            # 2D list files
+            outlier_topk_2d_json_names_txt = output_dir / 'outlier_topk_2d_json_names.txt'
+            outlier_topk_2d_json_paths_txt = output_dir / 'outlier_topk_2d_json_paths.txt'
 
             with open(per_frame_path, 'w') as f:
-                json.dump(frame_reports_sorted, f, indent=2)
-            with open(outlier_topk_path, 'w') as f:
-                json.dump(topk_reports, f, indent=2)
+                json.dump(frame_reports, f, indent=2)
+            with open(outlier_topk_3d_path, 'w') as f:
+                json.dump(topk_3d_reports, f, indent=2)
+            with open(outlier_topk_2d_path, 'w') as f:
+                json.dump(topk_2d_reports, f, indent=2)
             with open(kp_summary_path, 'w') as f:
                 json.dump(kp_summary, f, indent=2)
+            
+            # Write 3D outlier lists
             with open(outlier_topk_json_names_txt, 'w') as f:
-                for item in topk_reports:
+                for item in topk_3d_reports:
                     name = item.get('json_name')
-                    if name:
-                        f.write(f"{name}\n")
+                    if name: f.write(f"{name}\n")
             with open(outlier_topk_json_paths_txt, 'w') as f:
-                for item in topk_reports:
+                for item in topk_3d_reports:
                     path = item.get('json_path')
-                    if path:
-                        f.write(f"{path}\n")
+                    if path: f.write(f"{path}\n")
+            
+            # Write 2D outlier lists
+            with open(outlier_topk_2d_json_names_txt, 'w') as f:
+                for item in topk_2d_reports:
+                    name = item.get('json_name')
+                    if name: f.write(f"{name}\n")
+            with open(outlier_topk_2d_json_paths_txt, 'w') as f:
+                for item in topk_2d_reports:
+                    path = item.get('json_path')
+                    if path: f.write(f"{path}\n")
 
-            print(f"Per-frame 3D error report saved to {per_frame_path}")
-            print(f"Top-{topk} outlier report saved to {outlier_topk_path}")
-            print(f"Per-keypoint 3D summary saved to {kp_summary_path}")
-            print(f"Top-{topk} json-name list saved to {outlier_topk_json_names_txt}")
-            print(f"Top-{topk} json-path list saved to {outlier_topk_json_paths_txt}")
+            print(f"Per-frame error report saved to {per_frame_path}")
+            print(f"Top-{topk} 3D outlier report saved to {outlier_topk_3d_path}")
+            print(f"Top-{topk} 2D outlier report saved to {outlier_topk_2d_path}")
+            print(f"Per-keypoint summary saved to {kp_summary_path}")
+            print(f"Top-{topk} 3D json-name list saved to {outlier_topk_json_names_txt}")
+            print(f"Top-{topk} 3D json-path list saved to {outlier_topk_json_paths_txt}")
+            print(f"Top-{topk} 2D json-name list saved to {outlier_topk_2d_json_names_txt}")
+            print(f"Top-{topk} 2D json-path list saved to {outlier_topk_2d_json_paths_txt}")
 
     if is_distributed:
         cleanup_distributed()
